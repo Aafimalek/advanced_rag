@@ -1,0 +1,231 @@
+@import "tailwindcss";
+
+@theme {
+  /* Sunset Theme - Warm & Vibrant */
+  --color-bg-primary: #1a1625;
+  --color-bg-secondary: #241e30;
+  --color-bg-tertiary: #2d2640;
+  --color-bg-elevated: #3a3250;
+  --color-text-primary: #fef3f0;
+  --color-text-secondary: #c4b5d6;
+  --color-text-muted: #9d8fb8;
+  --color-accent-primary: #ff6b35;
+  --color-accent-secondary: #ff8c42;
+  --color-accent-tertiary: #ffa07a;
+  --color-accent-success: #50c878;
+  --color-accent-warning: #ffd700;
+  --color-accent-error: #ff4757;
+  --color-accent-pink: #ff6b9d;
+  --color-border: #4a4062;
+  --color-border-muted: #362f48;
+  
+  --font-family-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+}
+
+/* Custom animations */
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes slideInRight {
+  from {
+    transform: translateX(120%);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: -1000px 0;
+  }
+  100% {
+    background-position: 1000px 0;
+  }
+}
+
+@keyframes pulse-glow {
+  0%, 100% {
+    box-shadow: 0 0 20px rgba(255, 107, 53, 0.3);
+  }
+  50% {
+    box-shadow: 0 0 40px rgba(255, 107, 53, 0.6), 0 0 60px rgba(255, 140, 66, 0.4);
+  }
+}
+
+body {
+  margin: 0;
+  height: 100vh;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+/* Custom scrollbar styles */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 6px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: #4a4062;
+  border-radius: 3px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: #ff6b35;
+}
+
+.chat-scrollbar::-webkit-scrollbar {
+  width: 8px;
+}
+
+.chat-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.chat-scrollbar::-webkit-scrollbar-thumb {
+  background: #4a4062;
+  border-radius: 4px;
+}
+
+.chat-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: #ff6b35;
+}
+
+/* Custom utility classes for animations */
+.animate-slide-up {
+  animation: slideUp 0.4s ease;
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.6s ease;
+}
+
+.animate-slide-in-right {
+  animation: slideInRight 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.animate-spin {
+  animation: spin 0.8s linear infinite;
+}
+
+/* Gradient text utility */
+.gradient-text {
+  background: linear-gradient(135deg, #ff6b35 0%, #ff8c42 50%, #ffa07a 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  animation: shimmer 8s linear infinite;
+  background-size: 1000px 100%;
+}
+
+/* Glassmorphism effect */
+.glass-effect {
+  background: rgba(36, 30, 48, 0.80);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(74, 64, 98, 0.6);
+}
+
+/* Bento box card */
+.bento-card {
+  background: linear-gradient(145deg, rgba(45, 38, 64, 0.9), rgba(36, 30, 48, 0.95));
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(74, 64, 98, 0.5);
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.bento-card:hover {
+  border-color: rgba(255, 107, 53, 0.6);
+  box-shadow: 0 8px 32px rgba(255, 107, 53, 0.25);
+  transform: translateY(-2px);
+}
+
+/* Hide webkit details marker */
+details summary::-webkit-details-marker {
+  display: none;
+}
+
+/* Citation badge styles */
+.citation-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 4px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: rgba(255, 107, 53, 0.15);
+  color: rgb(255, 160, 122);
+  font-size: 0.75rem;
+  font-weight: 500;
+  border: 1px solid rgba(255, 107, 53, 0.3);
+  transition: all 0.2s;
+}
+
+.citation-badge:hover {
+  background: rgba(255, 107, 53, 0.25);
+  border-color: rgba(255, 107, 53, 0.5);
+  transform: translateY(-1px);
+}
+
+/* Improved message typography */
+.message-content p {
+  line-height: 1.7;
+  margin-bottom: 0.75rem;
+}
+
+.message-content p:last-child {
+  margin-bottom: 0;
+}
+
+/* Bullet points in messages */
+.message-content ul {
+  list-style: none;
+  padding-left: 0;
+  margin: 0.5rem 0;
+}
+
+.message-content ul li {
+  padding-left: 1.5rem;
+  position: relative;
+  margin-bottom: 0.5rem;
+}
+
+.message-content ul li::before {
+  content: "•";
+  position: absolute;
+  left: 0.5rem;
+  color: rgba(255, 107, 53, 0.7);
+  font-weight: bold;
+}
