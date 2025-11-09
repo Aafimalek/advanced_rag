@@ -18,12 +18,13 @@
 ## 🌟 Features
 
 ### Core Capabilities
+- 🔑 **User-Provided API Keys**: Bring your own Google Gemini API key - stored securely in your browser
 - 📄 **Multi-Format Support**: Upload and analyze PDF, DOCX, and PPTX documents
 - 🧠 **Advanced RAG System**: Multi-vector retrieval with Google Gemini embeddings
 - 💬 **Real-time Streaming**: Live AI responses with Server-Sent Events (SSE)
 - 🎯 **Accurate Citations**: Every answer includes page number references
 - 🖼️ **Multimodal Processing**: Extracts and analyzes text, tables, and images
-- 🗂️ **Chat History**: Persistent conversation management with multiple chats LocalStorage
+- 🗂️ **Chat History**: Persistent conversation management with multiple chats
 - 🗑️ **Easy Management**: Delete chats and associated documents with one click
 - 🎨 **Modern UI**: Beautiful sunset-themed interface with glassmorphism effects
 
@@ -41,25 +42,25 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        Frontend (React + Vite)                   │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐         │
-│  │   Sidebar    │  │  Document    │  │ Chat Panel   │         │
-│  │  (Chats)     │  │   Viewer     │  │  (Messages)  │         │
-│  └──────────────┘  └──────────────┘  └──────────────┘         │
+│                        Frontend (React + Vite)                  │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐           │
+│  │   Sidebar    │  │  Document    │  │ Chat Panel   │           │
+│  │  (Chats)     │  │   Viewer     │  │  (Messages)  │           │
+│  └──────────────┘  └──────────────┘  └──────────────┘           │
 └─────────────────────────────────────────────────────────────────┘
                             ↕ REST API + SSE
 ┌─────────────────────────────────────────────────────────────────┐
-│                     Backend (FastAPI + LangChain)                │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐         │
-│  │  Document    │→ │   FAISS      │→ │    Gemini    │         │
-│  │  Processing  │  │Vector Store  │  │   LLM API    │         │
-│  └──────────────┘  └──────────────┘  └──────────────┘         │
-│         ↓                 ↓                   ↓                  │
-│  [Unstructured]    [Embeddings]      [Streaming Response]      │
+│                     Backend (FastAPI + LangChain)               │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐           │
+│  │  Document    │→ │   FAISS      │→ │    Gemini    │           │
+│  │  Processing  │  │Vector Store  │  │   LLM API    │           │
+│  └──────────────┘  └──────────────┘  └──────────────┘           │
+│         ↓                 ↓                   ↓                 │
+│  [Unstructured]    [Embeddings]      [Streaming Response]       │
 └─────────────────────────────────────────────────────────────────┘
                             ↕
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Persistence Layer                             │
+│                    Persistence Layer                            │
 │  [chat_history.json] [documents.json] [faiss_index/] [uploads/] │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -87,7 +88,7 @@
 ### Prerequisites
 - Python 3.11 or higher
 - Node.js 18+ and npm
-- Google Gemini API key ([Get one here](https://makersuite.google.com/app/apikey))
+- Google Gemini API key ([Get your free key here](https://aistudio.google.com/app/apikey))
 
 ### 1. Clone the Repository
 ```bash
@@ -114,13 +115,8 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-#### Configure Environment
-Create a `.env` file in the `backend` directory:
-```env
-GEMINI_API_KEY=your_gemini_api_key_here
-```
-
 #### Start Backend Server
+> **Note**: No `.env` file or API key configuration is needed for the backend! Users provide their own API keys through the web interface.
 ```bash
 python main.py
 ```
@@ -143,6 +139,19 @@ Frontend will run on `http://localhost:5173`
 ---
 
 ## 📖 Usage
+
+### First Time Setup
+
+1. **Enter Your API Key**
+   - When you first visit the app, you'll see a modal asking for your Google Gemini API key
+   - Get a free key at [https://aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)
+   - Enter your API key (starts with `AIzaSy...`)
+   - Your key is stored securely in your browser's localStorage
+   - The key is never sent to or stored on any server
+
+2. **Manage Your API Key**
+   - Click the key icon (🔑) in the header to update or remove your API key
+   - You can change your key anytime without losing your chat history
 
 ### Basic Workflow
 
@@ -226,10 +235,25 @@ http://localhost:8000
 
 ### Endpoints
 
-#### 1. Upload Document
+#### 1. Validate API Key
+```http
+POST /validate-api-key
+Headers:
+  X-API-Key: your_gemini_api_key
+
+Response:
+{
+  "valid": true,
+  "message": "API key is valid"
+}
+```
+
+#### 2. Upload Document
 ```http
 POST /upload
 Content-Type: multipart/form-data
+Headers:
+  X-API-Key: your_gemini_api_key
 
 Parameters:
   - file: Binary file (PDF/DOCX/PPTX)
@@ -274,6 +298,8 @@ Response: 200 OK
 ```http
 POST /chats/{chat_id}/query
 Content-Type: application/json
+Headers:
+  X-API-Key: your_gemini_api_key
 
 Body:
 {
@@ -316,7 +342,6 @@ chat_rag/
 ├── backend/
 │   ├── main.py                 # FastAPI application
 │   ├── requirements.txt        # Python dependencies
-│   ├── .env                    # Environment variables
 │   ├── chat_history.json       # Chat persistence
 │   ├── documents.json          # Document metadata
 │   ├── uploads/                # Uploaded files
@@ -327,6 +352,8 @@ chat_rag/
 │   ├── src/
 │   │   ├── App.jsx            # Main application
 │   │   ├── components/
+│   │   │   ├── ApiKeyModal.jsx      # API key setup modal
+│   │   │   ├── ApiKeySettings.jsx   # API key management
 │   │   │   ├── ChatPanel.jsx        # Chat interface
 │   │   │   ├── ChatSidebar.jsx      # Chat list
 │   │   │   ├── DocumentViewer.jsx   # PDF viewer
@@ -336,10 +363,11 @@ chat_rag/
 │   │   ├── index.css          # Global styles
 │   │   └── main.jsx           # React entry
 │   ├── package.json           # Node dependencies
-│   ├── vite.config.js         # Vite configuration
-│   └── tailwind.config.js     # Tailwind setup
+│   └── vite.config.js         # Vite configuration
 │
-└── README.md                  # This file
+├── README.md                  # This file
+├── SETUP.md                   # Quick start guide
+└── .gitignore                 # Git ignore rules
 ```
 
 ---
@@ -464,8 +492,9 @@ rm -rf backend/docstore/
 
 #### 3. Gemini API errors
 **Solution**: Check your API key and quotas
-- Verify `.env` file exists with correct key
-- Check [Google AI Studio](https://makersuite.google.com) for usage limits
+- Verify your API key in the app settings (click the key icon)
+- Check [Google AI Studio](https://aistudio.google.com) for usage limits
+- Make sure your API key starts with `AIzaSy`
 
 #### 4. "Cannot find this information"
 **Solution**: The query might be too broad or info not in document
@@ -499,17 +528,24 @@ rm -rf backend/docstore/
 
 ## 🔐 Security Considerations
 
+### API Key Management
+- ✅ **Client-Side Storage**: API keys are stored in browser localStorage
+- ✅ **No Server Storage**: Keys are never stored on the backend
+- ✅ **Secure Transmission**: Keys sent via HTTPS headers (X-API-Key)
+- ✅ **User Control**: Users can update/remove keys anytime
+- ⚠️ **Important**: In production, consider implementing additional authentication layers
+
 ### Production Deployment
-- [ ] Add authentication (JWT tokens)
-- [ ] Implement rate limiting
-- [ ] Enable HTTPS/TLS
+- [ ] Add authentication (JWT tokens) for multi-user support
+- [ ] Implement rate limiting per API key
+- [ ] Enable HTTPS/TLS (required for secure key transmission)
 - [ ] Validate file uploads (size, type)
 - [ ] Sanitize user inputs
-- [ ] Use environment variables for secrets
 - [ ] Enable CORS only for trusted origins
 - [ ] Implement request timeouts
 - [ ] Add logging and monitoring
 - [ ] Set up backup for data files
+- [ ] Consider using a secure key management service for enterprise deployments
 
 ---
 
@@ -552,9 +588,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📞 Support
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/chat_rag/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/chat_rag/discussions)
-- **Email**: your.email@example.com
+- **Issues**: [GitHub Issues](https://github.com/Aafimalek/advanced_rag/issues)
 
 ---
 

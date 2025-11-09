@@ -31,11 +31,8 @@ warnings.filterwarnings(
 )
 
 # --- Environment and API Keys ---
-load_dotenv()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-if not GEMINI_API_KEY:
-    raise ValueError("Please set the GEMINI_API_KEY environment variable in your .env file.")
-os.environ["GOOGLE_API_KEY"] = GEMINI_API_KEY
+# Note: API keys are now provided by users via headers, not environment variables
+load_dotenv()  # Keep for any other env vars
 
 # --- LangChain and Gemini Models ---
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
@@ -121,14 +118,10 @@ async def lifespan(app: FastAPI):
         with open(DOCUMENTS_MANIFEST_FILE, "w") as f:
             json.dump([], f)
 
-    # Initialize models
-    embeddings = GoogleGenerativeAIEmbeddings(model=EMBED_MODEL, google_api_key=GEMINI_API_KEY)
-    llm = ChatGoogleGenerativeAI(
-        model=LLM_MODEL, 
-        temperature=0.3,  # Slightly higher for better responses
-        google_api_key=GEMINI_API_KEY,
-        max_retries=2,  # Retry on failures
-    )
+    # Models will be initialized per-request with user-provided API keys
+    # We keep these as None for now
+    embeddings = None
+    llm = None
     
     # Initialize text splitter
     text_splitter = RecursiveCharacterTextSplitter(
@@ -137,18 +130,12 @@ async def lifespan(app: FastAPI):
         separators=["\n\n", "\n", ". ", "! ", "? ", ", ", " "]
     )
     
-    # Initialize FAISS vectorstore
-    if os.path.exists(VEC_DIR) and os.path.exists(os.path.join(VEC_DIR, "index.faiss")):
-        vectorstore = FAISS.load_local(VEC_DIR, embeddings, allow_dangerous_deserialization=True)
-        print("✔ Loaded existing FAISS index.")
-    else:
-        # Create a dummy index to start with. It will be populated by uploads.
-        if not os.path.exists(VEC_DIR):
-            os.makedirs(VEC_DIR)
-        dummy_doc = Document(page_content="initial empty doc")
-        vectorstore = FAISS.from_documents([dummy_doc], embeddings)
-        vectorstore.save_local(VEC_DIR)
-        print("✔ Created new FAISS index.")
+    # Vectorstore will be loaded per-request with user API keys
+    # We'll check if the index exists and create directory structure
+    if not os.path.exists(VEC_DIR):
+        os.makedirs(VEC_DIR)
+    vectorstore = None
+    print("✔ Vector store directory initialized.")
         
     # Create chat history file if it doesn't exist
     if not CHAT_HISTORY_FILE.exists():
@@ -157,12 +144,8 @@ async def lifespan(app: FastAPI):
         print(f"✔ Created new chat history file at {CHAT_HISTORY_FILE}")
 
     docstore = LocalFileStore(str(DOCSTORE_DIR))
-    retriever = MultiVectorRetriever(
-        vectorstore=vectorstore,
-        docstore=docstore,
-        id_key="doc_id",
-    )
-    print("✔ Models, stores, and retriever initialized.")
+    retriever = None  # Will be initialized per-request
+    print("✔ Document store initialized.")
     
     yield
     
@@ -189,6 +172,49 @@ class QueryRequest(BaseModel):
 
 class NewChatRequest(BaseModel):
     document_id: str
+
+# --- API Key Helper Functions ---
+def get_api_key_from_request(request: Request) -> str:
+    """Extracts API key from request headers."""
+    api_key = request.headers.get("X-API-Key")
+    if not api_key:
+        raise HTTPException(status_code=401, detail="API key is required. Please provide X-API-Key header.")
+    return api_key
+
+def get_embeddings_model(api_key: str):
+    """Creates an embeddings model with the provided API key."""
+    return GoogleGenerativeAIEmbeddings(model=EMBED_MODEL, google_api_key=api_key)
+
+def get_llm_model(api_key: str):
+    """Creates an LLM model with the provided API key."""
+    return ChatGoogleGenerativeAI(
+        model=LLM_MODEL,
+        temperature=0.3,
+        google_api_key=api_key,
+        max_retries=2,
+    )
+
+def get_vectorstore(api_key: str):
+    """Loads or creates vectorstore with the provided API key."""
+    embeddings_model = get_embeddings_model(api_key)
+    
+    if os.path.exists(VEC_DIR) and os.path.exists(os.path.join(VEC_DIR, "index.faiss")):
+        return FAISS.load_local(VEC_DIR, embeddings_model, allow_dangerous_deserialization=True)
+    else:
+        # Create a new index
+        dummy_doc = Document(page_content="initial empty doc")
+        vs = FAISS.from_documents([dummy_doc], embeddings_model)
+        vs.save_local(VEC_DIR)
+        return vs
+
+def get_retriever(api_key: str):
+    """Creates a retriever with the provided API key."""
+    vs = get_vectorstore(api_key)
+    return MultiVectorRetriever(
+        vectorstore=vs,
+        docstore=docstore,
+        id_key="doc_id",
+    )
 
 # --- Helper Functions for Persistence ---
 async def read_json_async(path: pathlib.Path) -> Any:
@@ -449,9 +475,10 @@ async def build_multimodal_elements_streaming(file_path: str):
     for elem in all_processed_elements:
         yield {"type": "element", "element": elem}
 
-async def index_file_streaming(fp: str, doc_id: str, original_filename: str):
+async def index_file_streaming(fp: str, doc_id: str, original_filename: str, api_key: str):
     """Async generator to index a file and yield status updates."""
-    global vectorstore, retriever
+    # Get vectorstore for this request with user's API key
+    vectorstore_user = get_vectorstore(api_key)
     
     yield {"step": "extraction", "message": f"Processing file: {original_filename}"}
     
@@ -482,10 +509,10 @@ async def index_file_streaming(fp: str, doc_id: str, original_filename: str):
             if 'chunk_index' in elem: metadata['chunk'] = elem['chunk_index']
 
             summary_doc = Document(page_content=elem["summary"], metadata=metadata)
-            await run_in_threadpool(vectorstore.add_documents, [summary_doc])
+            await run_in_threadpool(vectorstore_user.add_documents, [summary_doc])
 
     yield {"step": "saving", "message": "Saving vector index to disk..."}
-    await run_in_threadpool(vectorstore.save_local, VEC_DIR)
+    await run_in_threadpool(vectorstore_user.save_local, VEC_DIR)
     
     # Update manifest
     yield {"step": "manifest", "message": "Updating document manifest..."}
@@ -618,12 +645,16 @@ async def query_rag(query: str, k: int = 6):
         "element_types": element_counts
     }
 
-async def answer_generator(chat_id: str, query: str, k: int):
+async def answer_generator(chat_id: str, query: str, k: int, api_key: str):
     """Generator that finds context, streams the LLM response, and saves history."""
+    
+    # Get models for this request with user's API key
+    vectorstore_user = get_vectorstore(api_key)
+    llm_user = get_llm_model(api_key)
     
     # 1. Retrieve context (non-streaming part, adapted from query_rag)
     print(f"\n🔍 Query for streaming: {query}")
-    summary_docs = await run_in_threadpool(vectorstore.similarity_search, query, k=k)
+    summary_docs = await run_in_threadpool(vectorstore_user.similarity_search, query, k=k)
     print(f"  📦 Retrieved {len(summary_docs)} document chunks from vector store")
     chunks_for_json = [{"page_content": doc.page_content, "metadata": doc.metadata} for doc in summary_docs]
     
@@ -681,7 +712,7 @@ async def answer_generator(chat_id: str, query: str, k: int):
     full_answer = ""
     print(f"  🤖 Streaming answer with multimodal LLM...")
     try:
-        async for chunk in llm.astream(messages):
+        async for chunk in llm_user.astream(messages):
             content = chunk.content
             if content:
                 full_answer += content
@@ -730,13 +761,13 @@ async def answer_generator(chat_id: str, query: str, k: int):
 
 
 # --- API Endpoints ---
-async def upload_generator(tmp_path: str, doc_id: str, filename: str):
+async def upload_generator(tmp_path: str, doc_id: str, filename: str, api_key: str):
     """Generator that processes the file and yields status updates."""
     try:
         yield f"data: {json.dumps({'step': 'setup', 'message': f'Starting processing for {filename}'})}\n\n"
 
         # The index_file_streaming function already handles the rest, including the final 'saving' step with all data
-        async for status in index_file_streaming(tmp_path, doc_id, filename):
+        async for status in index_file_streaming(tmp_path, doc_id, filename, api_key):
             yield f"data: {json.dumps(status)}\n\n"
 
     except Exception as e:
@@ -749,10 +780,36 @@ async def upload_generator(tmp_path: str, doc_id: str, filename: str):
     #     await run_in_threadpool(os.remove, tmp_path)
 
 
+# --- API Key Validation Endpoint ---
+@app.post("/validate-api-key")
+async def validate_api_key_endpoint(request: Request):
+    """Validates the provided API key by attempting to create a simple embeddings model."""
+    try:
+        api_key = get_api_key_from_request(request)
+        
+        # Try to create an embeddings model to test the API key
+        test_embeddings = get_embeddings_model(api_key)
+        
+        # Perform a simple test to validate the key works
+        # This will raise an exception if the key is invalid
+        await run_in_threadpool(test_embeddings.embed_query, "test")
+        
+        return {"valid": True, "message": "API key is valid"}
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        error_msg = str(e)
+        if "API_KEY_INVALID" in error_msg or "invalid" in error_msg.lower():
+            raise HTTPException(status_code=401, detail="Invalid API key. Please check your Google Gemini API key.")
+        raise HTTPException(status_code=500, detail=f"Failed to validate API key: {error_msg}")
+
 @app.post("/upload")
-async def upload_file_endpoint(file: UploadFile = File(...)):
+async def upload_file_endpoint(request: Request, file: UploadFile = File(...)):
     """Uploads a file, saves it permanently, then streams the indexing process."""
     try:
+        # Validate API key first
+        api_key = get_api_key_from_request(request)
+        
         file_suffix = pathlib.Path(file.filename).suffix
         doc_id = str(uuid.uuid4())
         permanent_path = UPLOADS_DIR / f"{doc_id}{file_suffix}"
@@ -762,10 +819,12 @@ async def upload_file_endpoint(file: UploadFile = File(...)):
             content = await file.read()
             await out_file.write(content)
 
+    except HTTPException as e:
+        raise e
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {e}")
 
-    return StreamingResponse(upload_generator(str(permanent_path), doc_id, file.filename), media_type="text/event-stream")
+    return StreamingResponse(upload_generator(str(permanent_path), doc_id, file.filename, api_key), media_type="text/event-stream")
 
 @app.get("/documents")
 async def get_documents_endpoint():
@@ -804,8 +863,11 @@ async def get_document_chats_endpoint(doc_id: str):
     )
 
 @app.post("/chats/{chat_id}/query")
-async def query_chat_endpoint(chat_id: str, request: QueryRequest):
+async def query_chat_endpoint(chat_id: str, req: Request, request: QueryRequest):
     """Receives a query, saves the user message, and returns a streaming RAG response."""
+    # Get API key from headers
+    api_key = get_api_key_from_request(req)
+    
     chat_history = await read_json_async(CHAT_HISTORY_FILE)
     
     if chat_id not in chat_history:
@@ -816,7 +878,7 @@ async def query_chat_endpoint(chat_id: str, request: QueryRequest):
     chat_history[chat_id]["messages"].append(user_message)
     await write_json_async(CHAT_HISTORY_FILE, chat_history)
     
-    return StreamingResponse(answer_generator(chat_id, request.query, request.k), media_type="text/event-stream")
+    return StreamingResponse(answer_generator(chat_id, request.query, request.k, api_key), media_type="text/event-stream")
 
 
 @app.get("/chats/{chat_id}")
