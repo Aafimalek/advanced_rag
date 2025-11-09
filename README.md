@@ -1,4 +1,4 @@
-# 📚 DocChat AI - Intelligent Document Q&A System
+# 📚 DocChat AI - Intelligent Advance RAG BASED Document Q&A System
 
 <div align="center">
 
@@ -68,7 +68,7 @@
 ### Technology Stack
 
 #### Backend
-- **Framework**: FastAPI 0.115+
+- **Framework**: FastAPI 
 - **LLM**: Google Gemini 2.5 Flash (via LangChain)
 - **Embeddings**: Google Gemini Embeddings
 - **Vector Store**: FAISS (Facebook AI Similarity Search)
@@ -76,7 +76,7 @@
 - **Async Runtime**: asyncio, aiofiles
 
 #### Frontend
-- **Framework**: React 18.3.1
+- **Framework**: React 
 - **Build Tool**: Vite
 - **Styling**: Tailwind CSS with custom sunset theme
 - **State Management**: React Hooks (useState, useEffect, useCallback)
@@ -92,7 +92,7 @@
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/yourusername/chat_rag.git
+git clone https://github.com/Aafimalek/advanced_rag.git
 cd chat_rag
 ```
 
@@ -173,25 +173,6 @@ Frontend will run on `http://localhost:5173`
    - Click on any chat in the sidebar to view it
    - Hover over a chat and click the trash icon to delete
 
-### Example Questions
-
-For a research paper:
-```
-- "What is this research paper about?"
-- "Who are the authors?"
-- "What BLEU scores did the model achieve?"
-- "Explain the Transformer architecture in detail"
-- "List the main contributions of this paper"
-```
-
-For a resume:
-```
-- "What programming languages does the candidate know?"
-- "List all projects mentioned in this resume"
-- "What is the candidate's educational background?"
-```
-
----
 
 ## 🔧 Configuration
 
@@ -509,22 +490,6 @@ rm -rf backend/docstore/
 
 ---
 
-## 📊 Performance
-
-### Benchmarks (On M1 MacBook Pro)
-- **Document Upload**: ~30-60 seconds for 15-page PDF
-- **Query Response**: ~2-5 seconds (streaming)
-- **Context Retrieval**: ~200ms for 20 chunks
-- **Embedding Generation**: ~100ms per chunk
-
-### Optimization Tips
-1. Use SSD for `faiss_index/` and `docstore/`
-2. Enable GPU acceleration for FAISS (if available)
-3. Batch process multiple documents
-4. Cache frequently accessed chunks
-5. Use CDN for static assets
-
----
 
 ## 🔐 Security Considerations
 
