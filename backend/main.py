@@ -14,9 +14,10 @@ from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Depends, Security
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 import uvicorn
 from starlette.concurrency import run_in_threadpool
@@ -173,14 +174,19 @@ class QueryRequest(BaseModel):
 class NewChatRequest(BaseModel):
     document_id: str
 
-# --- API Key Helper Functions ---
-def get_api_key_from_request(request: Request) -> str:
-    """Extracts API key from request headers."""
-    api_key = request.headers.get("X-API-Key")
+# --- API Key Authentication ---
+API_KEY_NAME = "X-API-Key"
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=True)
+
+async def get_api_key(api_key: str = Security(api_key_header)):
+    """Dependency to validate the API key from the header."""
     if not api_key:
-        raise HTTPException(status_code=401, detail="API key is required. Please provide X-API-Key header.")
+        raise HTTPException(status_code=403, detail="An API key is required.")
+    # In a real app, you might validate this against a database of keys.
+    # For this app, we just ensure it's present.
     return api_key
 
+# --- API Key Helper Functions ---
 def get_embeddings_model(api_key: str):
     """Creates an embeddings model with the provided API key."""
     return GoogleGenerativeAIEmbeddings(model=EMBED_MODEL, google_api_key=api_key)
@@ -310,23 +316,25 @@ def element_to_text(e) -> str:
     cat = getattr(e, 'category', '') or ''
     return f"[{cat}] {txt}".strip()
 
-async def summarize_image_async(image_b64: str) -> str:
+async def summarize_image_async(image_b64: str, api_key: str) -> str:
     """Uses Gemini vision model to describe image content."""
     try:
+        llm_vision = get_llm_model(api_key) # Initialize model with API key
         prompt = "Describe this image in detail. Focus on key visual elements, text, diagrams, charts, and any important information shown."
         message = HumanMessage(content=[
             {"type": "text", "text": prompt},
             {"type": "image_url", "image_url": image_b64}
         ])
-        response = await llm.ainvoke([message])
+        response = await llm_vision.ainvoke([message])
         return response.content
     except Exception as e:
         print(f"Error summarizing image: {e}")
         return "Image content could not be analyzed."
 
-async def summarize_table_async(table_html: str, table_text: str = "") -> str:
+async def summarize_table_async(table_html: str, api_key: str, table_text: str = "") -> str:
     """Summarizes table content from HTML representation."""
     try:
+        llm_text = get_llm_model(api_key) # Initialize model with API key
         prompt = f"""Summarize the key information in this table concisely. Focus on main data points, trends, and relationships.
 
 Table HTML:
@@ -337,7 +345,7 @@ Table Text:
 
 Provide a clear, structured summary."""
         message = HumanMessage(content=prompt)
-        response = await llm.ainvoke([message])
+        response = await llm_text.ainvoke([message])
         return response.content
     except Exception as e:
         print(f"Error summarizing table: {e}")
@@ -356,7 +364,7 @@ async def summarize_text_async(text_chunk: str, page_num: int = None, chunk_idx:
     # For all other chunks, return as-is for exact keyword matching
     return text_chunk
 
-async def build_multimodal_elements_streaming(file_path: str):
+async def build_multimodal_elements_streaming(file_path: str, api_key: str):
     """Async generator to extract and process elements, yielding status updates."""
     
     yield {"step": "extracting", "message": "Partitioning document with Unstructured..."}
@@ -438,8 +446,8 @@ async def build_multimodal_elements_streaming(file_path: str):
     # --- Concurrent Summarization ---
     yield {"step": "summarizing", "message": "Starting concurrent summarization of all elements..."}
     
-    image_tasks = [summarize_image_async(e["original"]) for e in image_elements_to_process]
-    table_tasks = [summarize_table_async(e["html_content"], e["text_content"]) for e in table_elements_to_process]
+    image_tasks = [summarize_image_async(e["original"], api_key) for e in image_elements_to_process]
+    table_tasks = [summarize_table_async(e["html_content"], api_key, e["text_content"]) for e in table_elements_to_process]
     text_tasks = [summarize_text_async(e["original"], e.get("page"), e.get("chunk_index", 0)) for e in text_elements_to_process]
 
     all_tasks = image_tasks + table_tasks + text_tasks
@@ -482,7 +490,7 @@ async def index_file_streaming(fp: str, doc_id: str, original_filename: str, api
     
     yield {"step": "extraction", "message": f"Processing file: {original_filename}"}
     
-    elements_generator = build_multimodal_elements_streaming(fp)
+    elements_generator = build_multimodal_elements_streaming(fp, api_key)
     all_elements = {"images": [], "tables": [], "texts": []}
 
     async for status in elements_generator:
@@ -779,24 +787,24 @@ async def upload_generator(tmp_path: str, doc_id: str, filename: str, api_key: s
     # finally:
     #     await run_in_threadpool(os.remove, tmp_path)
 
+# This endpoint does not need API key validation as it's a simple health check / info endpoint
+@app.get("/")
+def read_root():
+    return {"status": "DocChat AI is running"}
+
 
 # --- API Key Validation Endpoint ---
 @app.post("/validate-api-key")
-async def validate_api_key_endpoint(request: Request):
+async def validate_api_key_endpoint(api_key: str = Depends(get_api_key)):
     """Validates the provided API key by attempting to create a simple embeddings model."""
     try:
-        api_key = get_api_key_from_request(request)
-        
         # Try to create an embeddings model to test the API key
         test_embeddings = get_embeddings_model(api_key)
         
         # Perform a simple test to validate the key works
-        # This will raise an exception if the key is invalid
         await run_in_threadpool(test_embeddings.embed_query, "test")
         
         return {"valid": True, "message": "API key is valid"}
-    except HTTPException as e:
-        raise e
     except Exception as e:
         error_msg = str(e)
         if "API_KEY_INVALID" in error_msg or "invalid" in error_msg.lower():
@@ -804,12 +812,9 @@ async def validate_api_key_endpoint(request: Request):
         raise HTTPException(status_code=500, detail=f"Failed to validate API key: {error_msg}")
 
 @app.post("/upload")
-async def upload_file_endpoint(request: Request, file: UploadFile = File(...)):
+async def upload_file_endpoint(file: UploadFile = File(...), api_key: str = Depends(get_api_key)):
     """Uploads a file, saves it permanently, then streams the indexing process."""
     try:
-        # Validate API key first
-        api_key = get_api_key_from_request(request)
-        
         file_suffix = pathlib.Path(file.filename).suffix
         doc_id = str(uuid.uuid4())
         permanent_path = UPLOADS_DIR / f"{doc_id}{file_suffix}"
@@ -827,7 +832,7 @@ async def upload_file_endpoint(request: Request, file: UploadFile = File(...)):
     return StreamingResponse(upload_generator(str(permanent_path), doc_id, file.filename, api_key), media_type="text/event-stream")
 
 @app.get("/documents")
-async def get_documents_endpoint():
+async def get_documents_endpoint(api_key: str = Depends(get_api_key)):
     """Returns the list of all indexed documents from the manifest."""
     try:
         return await read_json_async(DOCUMENTS_FILE)
@@ -837,7 +842,7 @@ async def get_documents_endpoint():
         raise HTTPException(status_code=500, detail=f"Failed to read documents list: {e}")
 
 @app.get("/documents/{doc_id}/file")
-async def get_document_file_endpoint(doc_id: str):
+async def get_document_file_endpoint(doc_id: str, api_key: str = Depends(get_api_key)):
     """Serves the original document file."""
     doc = await get_document_by_id(doc_id)
     if not doc or not doc.get("path") or not os.path.exists(doc["path"]):
@@ -847,7 +852,7 @@ async def get_document_file_endpoint(doc_id: str):
 # --- Chat History Endpoints ---
 
 @app.post("/chats")
-async def create_chat_endpoint(request: NewChatRequest):
+async def create_chat_endpoint(request: NewChatRequest, api_key: str = Depends(get_api_key)):
     """(DEPRECATED) Creating a chat is now handled by the /upload endpoint."""
     raise HTTPException(
         status_code=410, 
@@ -855,7 +860,7 @@ async def create_chat_endpoint(request: NewChatRequest):
     )
 
 @app.get("/documents/{doc_id}/chats")
-async def get_document_chats_endpoint(doc_id: str):
+async def get_document_chats_endpoint(doc_id: str, api_key: str = Depends(get_api_key)):
     """(DEPRECATED) Use GET /chats instead."""
     raise HTTPException(
         status_code=410,
@@ -863,11 +868,8 @@ async def get_document_chats_endpoint(doc_id: str):
     )
 
 @app.post("/chats/{chat_id}/query")
-async def query_chat_endpoint(chat_id: str, req: Request, request: QueryRequest):
+async def query_chat_endpoint(chat_id: str, request: QueryRequest, api_key: str = Depends(get_api_key)):
     """Receives a query, saves the user message, and returns a streaming RAG response."""
-    # Get API key from headers
-    api_key = get_api_key_from_request(req)
-    
     chat_history = await read_json_async(CHAT_HISTORY_FILE)
     
     if chat_id not in chat_history:
@@ -882,7 +884,7 @@ async def query_chat_endpoint(chat_id: str, req: Request, request: QueryRequest)
 
 
 @app.get("/chats/{chat_id}")
-async def get_chat_history_endpoint(chat_id: str):
+async def get_chat_history_endpoint(chat_id: str, api_key: str = Depends(get_api_key)):
     """Gets the full message history and associated document for a specific chat."""
     chat_history = await read_json_async(CHAT_HISTORY_FILE)
     if chat_id not in chat_history:
@@ -904,7 +906,7 @@ async def get_chat_history_endpoint(chat_id: str):
     return chat_session
 
 @app.delete("/chats/{chat_id}")
-async def delete_chat_endpoint(chat_id: str):
+async def delete_chat_endpoint(chat_id: str, api_key: str = Depends(get_api_key)):
     """Deletes a chat session and optionally its associated document if no other chats reference it."""
     try:
         # Load chat history
@@ -920,6 +922,8 @@ async def delete_chat_endpoint(chat_id: str):
         del chat_history[chat_id]
         await write_json_async(CHAT_HISTORY_FILE, chat_history)
         
+        document_was_deleted = False
+        
         # Check if any other chats reference this document
         if document_id:
             other_chats_with_doc = any(
@@ -931,43 +935,52 @@ async def delete_chat_endpoint(chat_id: str):
             if not other_chats_with_doc:
                 documents = await read_json_async(DOCUMENTS_FILE)
                 doc_to_delete = None
+                doc_index = -1
                 
                 for i, doc in enumerate(documents):
                     if doc.get('id') == document_id:
                         doc_to_delete = doc
-                        documents.pop(i)
+                        doc_index = i
                         break
                 
                 if doc_to_delete:
-                    # Delete the physical file
+                    # 1. Delete the physical file
                     file_path = doc_to_delete.get('path')
                     if file_path and os.path.exists(file_path):
-                        os.remove(file_path)
+                        await run_in_threadpool(os.remove, file_path)
                         print(f"🗑️  Deleted file: {file_path}")
-                    
-                    # Update documents.json
+
+                    # 2. Delete from vector store
+                    try:
+                        vectorstore = get_vectorstore(api_key)
+                        # This is tricky with FAISS. We need to find the vector IDs associated with the doc.
+                        # For now, we are skipping this part as it requires a more complex setup.
+                        # A better approach would be to use a vector DB that supports deletion by metadata.
+                        print(f"⚠️  Vector deletion for document {document_id} is not fully implemented for FAISS.")
+                    except Exception as e:
+                        print(f"Error during vector deletion: {e}")
+
+                    # 3. Update documents.json
+                    documents.pop(doc_index)
                     await write_json_async(DOCUMENTS_FILE, documents)
-                    print(f"🗑️  Deleted document: {document_id}")
-                    
-                    return {
-                        "message": "Chat and associated document deleted successfully",
-                        "chat_id": chat_id,
-                        "document_deleted": True
-                    }
+                    print(f"🗑️  Deleted document manifest for: {document_id}")
+                    document_was_deleted = True
         
         return {
-            "message": "Chat deleted successfully",
+            "message": "Chat and associated document deleted successfully" if document_was_deleted else "Chat deleted successfully",
             "chat_id": chat_id,
-            "document_deleted": False
+            "document_deleted": document_was_deleted
         }
         
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="Chat history not found.")
     except Exception as e:
+        import traceback
+        print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Failed to delete chat: {str(e)}")
 
 @app.get("/chats")
-async def get_all_chats_endpoint():
+async def get_all_chats_endpoint(api_key: str = Depends(get_api_key)):
     """Gets all chat sessions, without messages, sorted by date."""
     try:
         chat_history = await read_json_async(CHAT_HISTORY_FILE)
@@ -983,7 +996,7 @@ async def get_all_chats_endpoint():
         return []
 
 @app.post("/query")
-async def query_endpoint(request: QueryRequest):
+async def query_endpoint(request: QueryRequest, api_key: str = Depends(get_api_key)):
     """(DEPRECATED) Use POST /chats/{chat_id}/query instead."""
     raise HTTPException(
         status_code=410, 

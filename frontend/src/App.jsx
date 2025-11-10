@@ -51,7 +51,7 @@ const API_URL = 'http://127.0.0.1:8000';
 
 function App() {
   // API Key State
-  const [apiKey, setApiKey] = useState(null);
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem('gemini_api_key') || null);
   
   // Global State
   const [toast, setToast] = useState(null);
@@ -434,7 +434,7 @@ function App() {
 
           {/* Main Content Area */}
           <main className="flex-1 flex overflow-hidden gap-0.5 bg-white/5">
-            <DocumentViewer document={activeChat?.document} />
+            <DocumentViewer document={activeChat?.document} apiKey={apiKey} />
             <ChatPanel
               activeChat={activeChat}
               messages={messages}

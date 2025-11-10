@@ -1,7 +1,52 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 
-const DocumentViewer = ({ document }) => {
+const DocumentViewer = ({ document, apiKey }) => {
+  const [fileUrl, setFileUrl] = useState(null);
+  const [error, setError] = useState(null);
   console.log('DocumentViewer received document:', document);
+
+  useEffect(() => {
+    // Clean up the object URL when the component unmounts or the document changes
+    return () => {
+      if (fileUrl && fileUrl.startsWith('blob:')) {
+        URL.revokeObjectURL(fileUrl);
+      }
+    };
+  }, [fileUrl]);
+
+  useEffect(() => {
+    if (document && apiKey) {
+      setError(null);
+      const fetchPdf = async () => {
+        try {
+          const response = await fetch(`http://127.0.0.1:8000/documents/${document.id}/file`, {
+            headers: {
+              'X-API-Key': apiKey,
+            },
+          });
+
+          if (!response.ok) {
+            throw new Error(`Failed to fetch PDF: ${response.status} ${response.statusText}`);
+          }
+
+          const blob = await response.blob();
+          const objectUrl = URL.createObjectURL(blob);
+          setFileUrl(objectUrl);
+        } catch (err) {
+          console.error('Error fetching document:', err);
+          setError('Could not load document. Please check the console for details.');
+          setFileUrl(null);
+        }
+      };
+
+      fetchPdf();
+    } else {
+      setFileUrl(null); // Clear the URL if no document or API key
+    }
+    // We also need to revoke the old URL when the document changes.
+    // The cleanup function from the first useEffect handles this.
+  }, [document, apiKey]);
+
 
   if (!document) {
     return (
@@ -23,7 +68,7 @@ const DocumentViewer = ({ document }) => {
     );
   }
 
-  const fileUrl = `http://127.0.0.1:8000/documents/${document.id}/file`;
+  const downloadUrl = `http://127.0.0.1:8000/documents/${document.id}/file`;
 
   return (
     <div className="basis-[45%] flex flex-col glass-effect overflow-hidden border-r border-white/5">
@@ -43,7 +88,7 @@ const DocumentViewer = ({ document }) => {
           </p>
         </div>
         <a 
-          href={fileUrl} 
+          href={downloadUrl} 
           target="_blank" 
           rel="noopener noreferrer"
           className="p-2 rounded-lg border border-white/10 hover:bg-white/10 hover:border-orange-500/30 transition-all"
@@ -56,13 +101,25 @@ const DocumentViewer = ({ document }) => {
       </div>
 
       {/* PDF Viewer */}
-      <div className="flex-1 relative overflow-hidden">
-        <iframe
-          src={`${fileUrl}#view=FitH`}
-          title={document.name}
-          className="absolute inset-0 w-full h-full border-0"
-          style={{ background: '#1a1a2e' }}
-        />
+      <div className="flex-1 relative overflow-hidden bg-[#241e30]">
+        {error && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center p-4 text-center">
+            <p className="text-red-400 font-semibold">Error</p>
+            <p className="text-gray-400 text-sm">{error}</p>
+          </div>
+        )}
+        {!error && fileUrl && (
+          <iframe
+            src={`${fileUrl}#view=FitH`}
+            title={document.name}
+            className="absolute inset-0 w-full h-full border-0"
+          />
+        )}
+        {!error && !fileUrl && !document && (
+           <div className="absolute inset-0 flex items-center justify-center">
+             <p className="text-gray-500">Loading document...</p>
+           </div>
+        )}
       </div>
     </div>
   );
