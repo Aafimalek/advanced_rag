@@ -16,5 +16,14 @@
       "texts": 27
     },
     "cached_at": "2026-01-05T11:40:04.726425"
+  },
+  "2c778b65884014c23322f1e1861db87d96ea5b9ee736305777539d4a7278403e": {
+    "doc_id": "7c03e451-9336-4156-996d-3f8346314ef7",
+    "filename": "manimancer-s3-bucket_accessKeys.csv",
+    "stats": {
+      "tables": 1,
+      "texts": 0
+    },
+    "cached_at": "2026-01-05T11:44:28.115948"
   }
 }

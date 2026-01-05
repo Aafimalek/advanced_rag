@@ -387,7 +387,7 @@ function App() {
             <input
               id="upload-input" 
               type="file" 
-              accept=".pdf,.docx,.pptx"
+              accept=".pdf,.docx,.doc,.csv,.xlsx,.xls"
               onChange={handleUpload} 
               disabled={isUploading} 
               className="hidden"
