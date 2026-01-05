@@ -48,8 +48,11 @@ backend/faiss_index/*
 !backend/faiss_index/.gitkeep
 backend/docstore/*
 !backend/docstore/.gitkeep
+backend/chroma_data/*
+!backend/chroma_data/.gitkeep
 backend/chat_history.json
 backend/documents.json
+backend/document_cache.json
 backend/*.log
 
 # Frontend Specific
