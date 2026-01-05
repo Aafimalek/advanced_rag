@@ -1039,6 +1039,9 @@ async def answer_generator(chat_id: str, query: str, k: int, api_key: str):
     
     # 1. Retrieve context (non-streaming part, adapted from query_rag)
     print(f"\n🔍 Query for streaming: {query}")
+    # Limit k to avoid retrieving too many chunks (max 10 to prevent token limit overflow)
+    # With TPM limit of 12k tokens, we need to be conservative
+    k = min(k, 10)
     summary_docs = await run_in_threadpool(vectorstore_user.similarity_search, query, k=k)
     print(f"  📦 Retrieved {len(summary_docs)} document chunks from vector store")
     chunks_for_json = [{"page_content": doc.page_content, "metadata": doc.metadata} for doc in summary_docs]
@@ -1067,13 +1070,29 @@ async def answer_generator(chat_id: str, query: str, k: int, api_key: str):
     # Build structured context with clear sections
     context_parts = []
     
+    # Limit individual chunk sizes to prevent huge tables from breaking context
+    # Reduced to stay within token limits (TPM: 12k tokens ≈ 48k chars total)
+    MAX_CHUNK_LENGTH = 20000  # Max 20k chars per chunk (~5k tokens)
+    
     if texts:
+        truncated_texts = []
+        for text in texts:
+            if len(text) > MAX_CHUNK_LENGTH:
+                truncated_texts.append(text[:MAX_CHUNK_LENGTH] + "\n[Text truncated due to length]")
+            else:
+                truncated_texts.append(text)
         context_parts.append("=== DOCUMENT TEXT ===")
-        context_parts.append("\n\n".join(texts))
+        context_parts.append("\n\n".join(truncated_texts))
     
     if tables:
+        truncated_tables = []
+        for table in tables:
+            if len(table) > MAX_CHUNK_LENGTH:
+                truncated_tables.append(table[:MAX_CHUNK_LENGTH] + "\n[Table truncated due to length]")
+            else:
+                truncated_tables.append(table)
         context_parts.append("\n\n=== TABLES AND STRUCTURED DATA ===")
-        context_parts.append("\n\n".join(tables))
+        context_parts.append("\n\n".join(truncated_tables))
     
     context = "\n\n".join(context_parts) if context_parts else "No context available."
     
@@ -1081,9 +1100,43 @@ async def answer_generator(chat_id: str, query: str, k: int, api_key: str):
     print(f"  📊 Context built: {len(texts)} text chunks, {len(tables)} tables")
     print(f"  📏 Total context length: {len(context)} characters")
     
+    # Limit context length to avoid exceeding LLM context window
+    # Groq models have TPM (tokens per minute) limits: 12,000 tokens
+    # Rough estimate: 1 token ≈ 4 characters, so 12k tokens ≈ 48k characters
+    # But we need to account for system prompt (~500 tokens) and query (~100 tokens)
+    # So safe limit is ~11k tokens ≈ 44k characters
+    # Using 40k characters as a conservative limit to stay well under TPM limits
+    MAX_CONTEXT_LENGTH = 40000  # characters (~10k tokens, leaving room for prompt and query)
+    
+    if len(context) > MAX_CONTEXT_LENGTH:
+        print(f"  ⚠️  Context too long ({len(context)} chars), truncating to {MAX_CONTEXT_LENGTH} chars...")
+        # Truncate intelligently - try to keep complete chunks
+        truncated_context = context[:MAX_CONTEXT_LENGTH]
+        # Try to cut at a reasonable boundary (newline or paragraph break)
+        last_newline = truncated_context.rfind('\n\n')
+        if last_newline > MAX_CONTEXT_LENGTH * 0.9:  # If we can find a break point near the limit
+            truncated_context = truncated_context[:last_newline]
+        truncated_context += f"\n\n[Context truncated - showing first {MAX_CONTEXT_LENGTH} characters of {len(context)} total]"
+        context = truncated_context
+        print(f"  📏 Truncated context length: {len(context)} characters")
+    
     # Build messages for the LLM
     messages = [SystemMessage(content=SYSTEM_PROMPT_TEMPLATE)]
     human_text = f"Query: {query}\n\nContext:\n{context}\n\nAnswer:"
+    
+    # Check total message length (system prompt + human message)
+    # Total should not exceed ~45k chars to stay within 12k token TPM limit
+    MAX_TOTAL_LENGTH = 45000  # characters (~11k tokens, leaving room for system prompt)
+    total_length = len(SYSTEM_PROMPT_TEMPLATE) + len(human_text)
+    if total_length > MAX_TOTAL_LENGTH:
+        print(f"  ⚠️  Total message length ({total_length} chars) exceeds safe limit ({MAX_TOTAL_LENGTH} chars), further truncating...")
+        # Further truncate the context
+        available_space = MAX_TOTAL_LENGTH - len(SYSTEM_PROMPT_TEMPLATE) - len(query) - 200  # Reserve space for query and formatting
+        if len(context) > available_space:
+            context = context[:available_space] + "\n\n[Context further truncated due to token limits]"
+            human_text = f"Query: {query}\n\nContext:\n{context}\n\nAnswer:"
+            print(f"  📏 Final context length after truncation: {len(context)} characters")
+    
     messages.append(HumanMessage(content=human_text))
 
     # 2. Stream the LLM response
@@ -1100,8 +1153,15 @@ async def answer_generator(chat_id: str, query: str, k: int, api_key: str):
         print(f"  ❌ Error during streaming: {error_msg}")
         
         # Handle specific API errors
-        if "rate limit" in error_msg.lower() or "429" in error_msg:
-            error_response = "I apologize, but the API rate limit was exceeded. Please try again in a moment."
+        if "rate limit" in error_msg.lower() or "429" in error_msg or "413" in error_msg:
+            if "tokens per day" in error_msg.lower() or "TPD" in error_msg:
+                error_response = "I apologize, but the daily API rate limit has been reached. Please try again tomorrow or upgrade your API plan."
+            elif "request too large" in error_msg.lower() or "TPM" in error_msg or "tokens per minute" in error_msg.lower():
+                error_response = "I apologize, but the document context is too large for the API rate limit. The document contains too much data. Please try asking a more specific question that targets a smaller portion of the document, or try again in a moment when the rate limit resets."
+            else:
+                error_response = "I apologize, but the API rate limit was exceeded. Please try again in a moment."
+        elif "context length" in error_msg.lower() or "context_length_exceeded" in error_msg.lower() or "reduce the length" in error_msg.lower():
+            error_response = "I apologize, but the document context is too large to process. Please try asking a more specific question or upload a smaller document."
         elif "API key" in error_msg.lower() or "authentication" in error_msg.lower():
             error_response = "I apologize, but there was an authentication error. Please check your API key."
         else:

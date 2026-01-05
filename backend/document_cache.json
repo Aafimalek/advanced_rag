@@ -25,5 +25,14 @@
       "texts": 0
     },
     "cached_at": "2026-01-05T11:44:28.115948"
+  },
+  "f1ec6d904ab5b4f5383ecab4e9757eb48389729e64f42c5d610df6a923a84982": {
+    "doc_id": "f2b47041-d479-43df-a803-6d8bedeeeef8",
+    "filename": "leads-1000.csv",
+    "stats": {
+      "tables": 1,
+      "texts": 0
+    },
+    "cached_at": "2026-01-05T11:53:22.540356"
   }
 }
