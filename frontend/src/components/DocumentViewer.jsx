@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 
-const DocumentViewer = ({ document, apiKey }) => {
+const DocumentViewer = ({ document }) => {
   const [fileUrl, setFileUrl] = useState(null);
   const [error, setError] = useState(null);
   console.log('DocumentViewer received document:', document);
@@ -15,15 +15,11 @@ const DocumentViewer = ({ document, apiKey }) => {
   }, [fileUrl]);
 
   useEffect(() => {
-    if (document && apiKey) {
+    if (document) {
       setError(null);
       const fetchPdf = async () => {
         try {
-          const response = await fetch(`http://127.0.0.1:8000/documents/${document.id}/file`, {
-            headers: {
-              'X-API-Key': apiKey,
-            },
-          });
+          const response = await fetch(`http://127.0.0.1:8000/documents/${document.id}/file`);
 
           if (!response.ok) {
             throw new Error(`Failed to fetch PDF: ${response.status} ${response.statusText}`);
@@ -41,11 +37,11 @@ const DocumentViewer = ({ document, apiKey }) => {
 
       fetchPdf();
     } else {
-      setFileUrl(null); // Clear the URL if no document or API key
+      setFileUrl(null); // Clear the URL if no document
     }
     // We also need to revoke the old URL when the document changes.
     // The cleanup function from the first useEffect handles this.
-  }, [document, apiKey]);
+  }, [document]);
 
 
   if (!document) {

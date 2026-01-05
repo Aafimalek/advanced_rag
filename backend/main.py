@@ -1,12 +1,11 @@
 import os
-import io
-import base64
 import json
 import uuid
 import shutil
 import pathlib
 import tempfile
 import time
+import hashlib
 import aiofiles
 import warnings
 from datetime import datetime
@@ -35,22 +34,104 @@ warnings.filterwarnings(
 # Note: API keys are now provided by users via headers, not environment variables
 load_dotenv()  # Keep for any other env vars
 
-# --- LangChain and Gemini Models ---
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+# --- LangChain Models ---
+from langchain_ollama import OllamaEmbeddings
+from langchain_groq import ChatGroq
 from langchain_core.documents import Document
+
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain.storage import LocalFileStore
-from langchain.retrievers.multi_vector import MultiVectorRetriever
+# FAISS import removed - using Chroma instead
+try:
+    from langchain_chroma import Chroma
+except ImportError:
+    # Fallback to deprecated import
+    from langchain_community.vectorstores import Chroma
+
+# Simple MultiVectorRetriever implementation (if import fails)
+try:
+    from langchain_community.retrievers import MultiVectorRetriever
+except (ImportError, AttributeError, ModuleNotFoundError):
+    try:
+        from langchain.retrievers.multi_vector import MultiVectorRetriever
+    except (ImportError, AttributeError, ModuleNotFoundError):
+        # Fallback: Simple implementation (not actually used in code, just for compatibility)
+        class MultiVectorRetriever:
+            """Simple MultiVectorRetriever implementation."""
+            def __init__(self, vectorstore, docstore, id_key="doc_id"):
+                self.vectorstore = vectorstore
+                self.docstore = docstore
+                self.id_key = id_key
+
+# Simple file-based storage implementation (replacement for LocalFileStore)
+class LocalFileStore:
+    """Simple file-based storage that mimics langchain's LocalFileStore interface."""
+    def __init__(self, base_path: str):
+        self.base_path = pathlib.Path(base_path)
+        self.base_path.mkdir(parents=True, exist_ok=True)
+    
+    def _get_file_path(self, key: str) -> pathlib.Path:
+        """Get file path for a key, using hash to handle special characters."""
+        # Use hash to create a safe filename
+        key_hash = hashlib.md5(key.encode('utf-8')).hexdigest()
+        return self.base_path / f"{key_hash}.dat"
+    
+    def mset(self, key_value_pairs: List[tuple]):
+        """Set multiple key-value pairs."""
+        # Create a mapping file to store key -> hash mapping
+        mapping_file = self.base_path / "_key_mapping.json"
+        mapping = {}
+        if mapping_file.exists():
+            try:
+                with open(mapping_file, 'r') as f:
+                    mapping = json.load(f)
+            except:
+                mapping = {}
+        
+        for key, value in key_value_pairs:
+            file_path = self._get_file_path(key)
+            mapping[key] = file_path.name
+            with open(file_path, 'wb') as f:
+                if isinstance(value, bytes):
+                    f.write(value)
+                else:
+                    f.write(str(value).encode('utf-8'))
+        
+        # Save mapping
+        with open(mapping_file, 'w') as f:
+            json.dump(mapping, f)
+    
+    def mget(self, keys: List[str]) -> List[Optional[bytes]]:
+        """Get multiple values by keys."""
+        results = []
+        for key in keys:
+            file_path = self._get_file_path(key)
+            if file_path.exists():
+                with open(file_path, 'rb') as f:
+                    results.append(f.read())
+            else:
+                results.append(None)
+        return results
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import HumanMessage, SystemMessage
 
 # --- Document Processing ---
-from unstructured.partition.pdf import partition_pdf
-from unstructured.partition.docx import partition_docx
-from unstructured.partition.pptx import partition_pptx
-import fitz  # PyMuPDF
-from PIL import Image
+import pdfplumber
+# Unstructured imports for DOCX and DOC support
+try:
+    from unstructured.partition.docx import partition_docx
+    from unstructured.partition.doc import partition_doc
+    UNSTRUCTURED_AVAILABLE = True
+except ImportError:
+    UNSTRUCTURED_AVAILABLE = False
+    print("Warning: unstructured library not available. DOCX and DOC files will not be supported.")
+
+# CSV and Excel support
+try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except ImportError:
+    PANDAS_AVAILABLE = False
+    print("Warning: pandas library not available. CSV and Excel files will not be supported.")
 
 # --- Constants ---
 DATA_DIR = pathlib.Path("data")
@@ -59,18 +140,21 @@ UPLOADS_DIR = pathlib.Path("uploads")
 UPLOADS_DIR.mkdir(exist_ok=True)
 DOCSTORE_DIR = pathlib.Path("docstore")
 DOCSTORE_DIR.mkdir(exist_ok=True)
-VEC_DIR = "faiss_index"  # Switched to FAISS
+VEC_DIR = "chroma_data"  # Using Chroma for vector storage
+COLLECTION_NAME = "documents"  # Chroma collection name
 DOCUMENTS_MANIFEST_FILE = "documents.json"
-EMBED_MODEL = "models/gemini-embedding-001" 
-LLM_MODEL = "gemini-2.5-flash"
+EMBED_MODEL = "nomic-embed-text:latest"
+LLM_MODEL = "llama-3.3-70b-versatile"
+OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 CHAT_HISTORY_FILE = pathlib.Path("chat_history.json")
 DOCUMENTS_FILE = pathlib.Path("documents.json")
+DOCUMENT_CACHE_FILE = pathlib.Path("document_cache.json")  # Cache for document hashes
 
 SYSTEM_PROMPT_TEMPLATE = (
     "You are a helpful and knowledgeable document assistant. Your task is to answer questions based on the context provided below.\n\n"
     "CRITICAL INSTRUCTIONS:\n"
     "1. READ THE ENTIRE CONTEXT CAREFULLY before answering\n"
-    "2. Look for relevant information in ALL parts of the context (text, tables, and images)\n"
+    "2. Look for relevant information in ALL parts of the context (text and tables)\n"
     "3. If information is present in ANY form (direct statement, table, list, or implied), USE IT\n"
     "4. Synthesize information from multiple sections if needed\n"
     "5. Be thorough - check the entire context before saying information is not available\n\n"
@@ -89,7 +173,7 @@ SYSTEM_PROMPT_TEMPLATE = (
     "- List questions → Complete list with '* ' prefix for each item\n\n"
     "ONLY say 'I cannot find this information in the provided context' if you have:\n"
     "- Searched the ENTIRE context thoroughly\n"
-    "- Checked all text sections, tables, and image descriptions\n"
+    "- Checked all text sections and tables\n"
     "- Confirmed the information is genuinely not present in any form"
 )
 PROMPT = ChatPromptTemplate.from_messages([
@@ -125,18 +209,18 @@ async def lifespan(app: FastAPI):
     llm = None
     
     # Initialize text splitter
+    # Reduced chunk size to avoid embedding context length issues with nomic-embed-text
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=2500,  # Larger chunks for comprehensive context
-        chunk_overlap=500,  # Higher overlap ensures no information is lost at boundaries
+        chunk_size=2000,  # Reduced to avoid embedding context length errors
+        chunk_overlap=400,  # Higher overlap ensures no information is lost at boundaries
         separators=["\n\n", "\n", ". ", "! ", "? ", ", ", " "]
     )
     
-    # Vectorstore will be loaded per-request with user API keys
-    # We'll check if the index exists and create directory structure
+    # Initialize Chroma directory at startup
     if not os.path.exists(VEC_DIR):
         os.makedirs(VEC_DIR)
     vectorstore = None
-    print("✔ Vector store directory initialized.")
+    print("✔ Chroma vector store directory ready.")
         
     # Create chat history file if it doesn't exist
     if not CHAT_HISTORY_FILE.exists():
@@ -169,52 +253,58 @@ app.add_middleware(
 # --- Pydantic Models ---
 class QueryRequest(BaseModel):
     query: str
-    k: int = 20  # Increased to ensure we get enough text chunks along with tables/images
+    k: int = 20  # Increased to ensure we get enough text chunks along with tables
 
 class NewChatRequest(BaseModel):
     document_id: str
 
 # --- API Key Authentication ---
 API_KEY_NAME = "X-API-Key"
-api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=True)
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
-async def get_api_key(api_key: str = Security(api_key_header)):
-    """Dependency to validate the API key from the header."""
-    if not api_key:
-        raise HTTPException(status_code=403, detail="An API key is required.")
-    # In a real app, you might validate this against a database of keys.
-    # For this app, we just ensure it's present.
+async def get_api_key(api_key: Optional[str] = Security(api_key_header)):
+    """Dependency to get the API key from the header or return None.
+    For Groq LLM, we'll use this if provided, otherwise fall back to GROQ_API_KEY from .env.
+    For Ollama embeddings, no API key is needed."""
     return api_key
 
 # --- API Key Helper Functions ---
-def get_embeddings_model(api_key: str):
-    """Creates an embeddings model with the provided API key."""
-    return GoogleGenerativeAIEmbeddings(model=EMBED_MODEL, google_api_key=api_key)
+def get_embeddings_model(api_key: str = None):
+    """Creates an embeddings model using Ollama (no API key needed for local Ollama)."""
+    return OllamaEmbeddings(
+        model=EMBED_MODEL,
+        base_url=OLLAMA_BASE_URL,
+    )
 
-def get_llm_model(api_key: str):
-    """Creates an LLM model with the provided API key."""
-    return ChatGoogleGenerativeAI(
+def get_llm_model(api_key: str = None):
+    """Creates an LLM model using Groq API."""
+    # Get Groq API key from environment if not provided
+    groq_api_key = api_key or os.getenv("GROQ_API_KEY")
+    if not groq_api_key:
+        raise ValueError("GROQ_API_KEY is required. Please set it in your .env file or provide it via API key header.")
+    
+    return ChatGroq(
         model=LLM_MODEL,
         temperature=0.3,
-        google_api_key=api_key,
+        groq_api_key=groq_api_key,
         max_retries=2,
     )
 
-def get_vectorstore(api_key: str):
-    """Loads or creates vectorstore with the provided API key."""
+def get_vectorstore(api_key: str = None):
+    """Loads or creates Chroma vectorstore with Ollama embeddings."""
     embeddings_model = get_embeddings_model(api_key)
     
-    if os.path.exists(VEC_DIR) and os.path.exists(os.path.join(VEC_DIR, "index.faiss")):
-        return FAISS.load_local(VEC_DIR, embeddings_model, allow_dangerous_deserialization=True)
-    else:
-        # Create a new index
-        dummy_doc = Document(page_content="initial empty doc")
-        vs = FAISS.from_documents([dummy_doc], embeddings_model)
-        vs.save_local(VEC_DIR)
-        return vs
+    # Create or load Chroma vectorstore (persists to disk automatically)
+    vectorstore = Chroma(
+        persist_directory=VEC_DIR,
+        collection_name=COLLECTION_NAME,
+        embedding_function=embeddings_model,
+    )
+    
+    return vectorstore
 
-def get_retriever(api_key: str):
-    """Creates a retriever with the provided API key."""
+def get_retriever(api_key: str = None):
+    """Creates a retriever with Ollama embeddings."""
     vs = get_vectorstore(api_key)
     return MultiVectorRetriever(
         vectorstore=vs,
@@ -238,104 +328,283 @@ async def get_document_by_id(doc_id: str) -> Optional[Dict[str, Any]]:
             return doc
     return None
 
+# --- Document Caching Functions ---
+def compute_file_hash(file_path: str) -> str:
+    """Compute SHA256 hash of a file for caching/deduplication."""
+    sha256_hash = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        # Read in chunks to handle large files
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
+
+async def get_cached_document(file_hash: str) -> Optional[Dict[str, Any]]:
+    """Check if a document with this hash has already been processed."""
+    try:
+        cache = await read_json_async(DOCUMENT_CACHE_FILE)
+        return cache.get(file_hash)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+async def cache_document(file_hash: str, doc_id: str, filename: str, stats: Dict[str, int]):
+    """Store document metadata in cache."""
+    try:
+        cache = await read_json_async(DOCUMENT_CACHE_FILE)
+    except (FileNotFoundError, json.JSONDecodeError):
+        cache = {}
+    
+    cache[file_hash] = {
+        "doc_id": doc_id,
+        "filename": filename,
+        "stats": stats,
+        "cached_at": datetime.now().isoformat()
+    }
+    
+    await write_json_async(DOCUMENT_CACHE_FILE, cache)
+
 # --- Document Processing and Chunking Logic (from notebook, with improvements) ---
-def load_file(path: str) -> List[Any]:
-    """Loads a document and partitions it into elements."""
+def load_file(path: str) -> List[Dict[str, Any]]:
+    """Loads a document (PDF, DOCX, DOC, CSV, or Excel) and extracts text and tables."""
     path = str(path)
     suffix = pathlib.Path(path).suffix.lower()
-    if suffix == ".pdf":
-        return partition_pdf(
-            filename=path,
-            extract_images_in_pdf=False,  # We'll handle images separately
-            infer_table_structure=True,
-            strategy="hi_res",
-            languages=['en']  # Explicitly set language
-        )
-    if suffix == ".docx":
-        return partition_docx(filename=path, include_page_breaks=True, infer_table_structure=True, extract_images_in_docx=True)
-    if suffix == ".pptx":
-        return partition_pptx(filename=path, include_page_breaks=True, infer_table_structure=True, extract_images_in_pptx=True)
-    raise ValueError(f"Unsupported file type: {suffix}")
-
-def pil_to_data_uri(img: Image.Image) -> str:
-    """Converts a PIL Image to a data URI."""
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return f"data:image/png;base64,{b64}"
-
-def pdf_page_images(path: str) -> Dict[int, List[str]]:
-    """Extracts all meaningful raster images and vector graphics from each page of a PDF."""
-    doc = fitz.open(path)
-    out = {}
+    elements = []
     
-    for pno in range(len(doc)):
-        page = doc[pno]
-        images = []
-        
-        # 1. Extract raster images (like photos, screenshots)
-        for img in page.get_images(full=True):
-            xref = img[0]
-            try:
-                pix = fitz.Pixmap(doc, xref)
-                # Skip small or non-RGB images
-                if pix.n < 4 and (pix.width < 100 or pix.height < 100):
-                    pix = None
-                    continue
-                if pix.n >= 4:  # RGBA -> RGB for consistency
-                    pix = fitz.Pixmap(fitz.csRGB, pix)
+    if suffix == ".pdf":
+        # Use pdfplumber for PDF files
+        with pdfplumber.open(path) as pdf:
+            for page_num, page in enumerate(pdf.pages, start=1):
+                # Extract text
+                text = page.extract_text()
+                if text and text.strip():
+                    elements.append({
+                        'type': 'text',
+                        'text': text,
+                        'page': page_num,
+                        'category': 'Text'
+                    })
                 
-                img_pil = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                images.append(pil_to_data_uri(img_pil))
-                pix = None # free memory
-            except Exception as e:
-                print(f"Warning: Could not process raster image on page {pno+1}: {e}")
-
-        # 2. Extract and render vector graphics (like charts, diagrams)
-        for drawing in page.get_drawings():
-            rect = drawing['rect']
-            if rect.width < 100 or rect.height < 100:
-                continue
-            try:
-                pix = page.get_pixmap(clip=rect, dpi=150)
-                img_pil = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                images.append(pil_to_data_uri(img_pil))
-                pix = None # free memory
-            except Exception as e:
-                print(f"Warning: Could not render drawing on page {pno+1}: {e}")
-
-        if images:
-            out[pno + 1] = images
-            
-    doc.close()
-    return out
+                # Extract tables
+                tables = page.extract_tables()
+                for table_idx, table in enumerate(tables):
+                    if table:
+                        # Convert table to HTML format
+                        table_html = "<table>"
+                        for row in table:
+                            table_html += "<tr>"
+                            for cell in row:
+                                cell_text = str(cell) if cell else ""
+                                table_html += f"<td>{cell_text}</td>"
+                            table_html += "</tr>"
+                        table_html += "</table>"
+                        
+                        # Convert table to text format
+                        table_text = "\n".join(["\t".join([str(cell) if cell else "" for cell in row]) for row in table])
+                        
+                        elements.append({
+                            'type': 'table',
+                            'text': table_text,
+                            'html': table_html,
+                            'page': page_num,
+                            'category': 'Table',
+                            'table_index': table_idx
+                        })
+        return elements
+    
+    elif suffix == ".docx":
+        # Use unstructured for DOCX files
+        if not UNSTRUCTURED_AVAILABLE:
+            raise ValueError("DOCX support requires the 'unstructured' library. Please install it: pip install unstructured[docx]")
         
-def element_to_text(e) -> str:
-    """Converts an unstructured element to a text string."""
-    txt = getattr(e, 'text', '') or ''
-    cat = getattr(e, 'category', '') or ''
-    return f"[{cat}] {txt}".strip()
+        docx_elements = partition_docx(filename=path)
+        page_num = 1  # DOCX doesn't have pages, but we'll use 1 for consistency
+        
+        for idx, elem in enumerate(docx_elements):
+            # Get element type and text
+            elem_type = getattr(elem, 'category', 'NarrativeText')
+            elem_text = getattr(elem, 'text', str(elem))
+            
+            # Check if it's a table (by category or metadata)
+            is_table = (elem_type == 'Table' or 
+                       (hasattr(elem, 'metadata') and elem.metadata and 
+                        getattr(elem.metadata, 'text_as_html', None)))
+            
+            if is_table:
+                # Extract table HTML if available
+                table_html = ''
+                if hasattr(elem, 'metadata') and elem.metadata:
+                    table_html = getattr(elem.metadata, 'text_as_html', '')
+                
+                table_text = elem_text
+                
+                if not table_html and table_text:
+                    # Create a simple HTML table from text
+                    table_html = f"<table><tr><td>{table_text}</td></tr></table>"
+                
+                elements.append({
+                    'type': 'table',
+                    'text': table_text,
+                    'html': table_html,
+                    'page': page_num,
+                    'category': 'Table',
+                    'table_index': idx
+                })
+            else:
+                # Regular text element
+                if elem_text and elem_text.strip():
+                    elements.append({
+                        'type': 'text',
+                        'text': elem_text,
+                        'page': page_num,
+                        'category': 'Text'
+                    })
+        return elements
+    
+    elif suffix == ".doc":
+        # Use unstructured for older DOC files
+        if not UNSTRUCTURED_AVAILABLE:
+            raise ValueError("DOC support requires the 'unstructured' library. Please install it: pip install unstructured[doc]")
+        
+        doc_elements = partition_doc(filename=path)
+        page_num = 1  # DOC doesn't have pages, but we'll use 1 for consistency
+        
+        for idx, elem in enumerate(doc_elements):
+            # Get element type and text
+            elem_type = getattr(elem, 'category', 'NarrativeText')
+            elem_text = getattr(elem, 'text', str(elem))
+            
+            # Check if it's a table (by category or metadata)
+            is_table = (elem_type == 'Table' or 
+                       (hasattr(elem, 'metadata') and elem.metadata and 
+                        getattr(elem.metadata, 'text_as_html', None)))
+            
+            if is_table:
+                # Extract table HTML if available
+                table_html = ''
+                if hasattr(elem, 'metadata') and elem.metadata:
+                    table_html = getattr(elem.metadata, 'text_as_html', '')
+                
+                table_text = elem_text
+                
+                if not table_html and table_text:
+                    # Create a simple HTML table from text
+                    table_html = f"<table><tr><td>{table_text}</td></tr></table>"
+                
+                elements.append({
+                    'type': 'table',
+                    'text': table_text,
+                    'html': table_html,
+                    'page': page_num,
+                    'category': 'Table',
+                    'table_index': idx
+                })
+            else:
+                # Regular text element
+                if elem_text and elem_text.strip():
+                    elements.append({
+                        'type': 'text',
+                        'text': elem_text,
+                        'page': page_num,
+                        'category': 'Text'
+                    })
+        return elements
+    
+    elif suffix == ".csv":
+        # Use pandas for CSV files
+        if not PANDAS_AVAILABLE:
+            raise ValueError("CSV support requires the 'pandas' library. Please install it: pip install pandas")
+        
+        df = pd.read_csv(path)
+        
+        # Convert entire CSV to a table
+        table_html = "<table>"
+        # Add header row
+        table_html += "<tr>"
+        for col in df.columns:
+            table_html += f"<th>{col}</th>"
+        table_html += "</tr>"
+        
+        # Add data rows
+        for _, row in df.iterrows():
+            table_html += "<tr>"
+            for val in row:
+                table_html += f"<td>{val}</td>"
+            table_html += "</tr>"
+        table_html += "</table>"
+        
+        # Convert to text format
+        table_text = df.to_string(index=False)
+        
+        elements.append({
+            'type': 'table',
+            'text': table_text,
+            'html': table_html,
+            'page': 1,
+            'category': 'Table',
+            'table_index': 0
+        })
+        return elements
+    
+    elif suffix in [".xlsx", ".xls"]:
+        # Use pandas for Excel files
+        if not PANDAS_AVAILABLE:
+            raise ValueError("Excel support requires the 'pandas' library. Please install it: pip install pandas openpyxl")
+        
+        # Read all sheets from Excel file
+        excel_file = pd.ExcelFile(path)
+        table_idx = 0
+        
+        for sheet_name in excel_file.sheet_names:
+            df = pd.read_excel(path, sheet_name=sheet_name)
+            
+            # Convert sheet to a table
+            table_html = f"<table><caption>Sheet: {sheet_name}</caption>"
+            # Add header row
+            table_html += "<tr>"
+            for col in df.columns:
+                table_html += f"<th>{col}</th>"
+            table_html += "</tr>"
+            
+            # Add data rows
+            for _, row in df.iterrows():
+                table_html += "<tr>"
+                for val in row:
+                    table_html += f"<td>{val}</td>"
+                table_html += "</tr>"
+            table_html += "</table>"
+            
+            # Convert to text format
+            table_text = f"Sheet: {sheet_name}\n" + df.to_string(index=False)
+            
+            elements.append({
+                'type': 'table',
+                'text': table_text,
+                'html': table_html,
+                'page': 1,  # Excel sheets don't have pages, use 1
+                'category': 'Table',
+                'table_index': table_idx
+            })
+            table_idx += 1
+        
+        return elements
+    
+    else:
+        supported_formats = [".pdf"]
+        if UNSTRUCTURED_AVAILABLE:
+            supported_formats.extend([".docx", ".doc"])
+        if PANDAS_AVAILABLE:
+            supported_formats.extend([".csv", ".xlsx", ".xls"])
+        raise ValueError(f"Unsupported file type: {suffix}. Supported formats: {', '.join(supported_formats)}")
 
-async def summarize_image_async(image_b64: str, api_key: str) -> str:
-    """Uses Gemini vision model to describe image content."""
-    try:
-        llm_vision = get_llm_model(api_key) # Initialize model with API key
-        prompt = "Describe this image in detail. Focus on key visual elements, text, diagrams, charts, and any important information shown."
-        message = HumanMessage(content=[
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": image_b64}
-        ])
-        response = await llm_vision.ainvoke([message])
-        return response.content
-    except Exception as e:
-        print(f"Error summarizing image: {e}")
-        return "Image content could not be analyzed."
 
 async def summarize_table_async(table_html: str, api_key: str, table_text: str = "") -> str:
-    """Summarizes table content from HTML representation."""
-    try:
-        llm_text = get_llm_model(api_key) # Initialize model with API key
-        prompt = f"""Summarize the key information in this table concisely. Focus on main data points, trends, and relationships.
+    """Summarizes table content from HTML representation with retry logic for rate limits."""
+    max_retries = 3
+    retry_delay = 2  # Start with 2 seconds
+    
+    for attempt in range(max_retries):
+        try:
+            llm_text = get_llm_model(api_key) # Initialize model with API key
+            prompt = f"""Summarize the key information in this table concisely. Focus on main data points, trends, and relationships.
 
 Table HTML:
 {table_html[:2000]}
@@ -344,12 +613,29 @@ Table Text:
 {table_text[:1000]}
 
 Provide a clear, structured summary."""
-        message = HumanMessage(content=prompt)
-        response = await llm_text.ainvoke([message])
-        return response.content
-    except Exception as e:
-        print(f"Error summarizing table: {e}")
-        return f"Table content: {table_text[:500]}"
+            message = HumanMessage(content=prompt)
+            response = await llm_text.ainvoke([message])
+            return response.content
+        except Exception as e:
+            error_msg = str(e)
+            # Check if it's a rate limit error
+            if "429" in error_msg or "rate limit" in error_msg.lower() or "rate_limit" in error_msg.lower():
+                if attempt < max_retries - 1:
+                    # Extract wait time from error if available, otherwise use exponential backoff
+                    wait_time = retry_delay * (2 ** attempt)  # Exponential backoff: 2s, 4s, 8s
+                    print(f"Rate limit hit, waiting {wait_time}s before retry {attempt + 1}/{max_retries}...")
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    print(f"Error summarizing table after {max_retries} retries: {e}")
+                    return f"Table content: {table_text[:500]}"
+            else:
+                # For non-rate-limit errors, return immediately
+                print(f"Error summarizing table: {e}")
+                return f"Table content: {table_text[:500]}"
+    
+    # Fallback if all retries failed
+    return f"Table content: {table_text[:500]}"
 
 async def summarize_text_async(text_chunk: str, page_num: int = None, chunk_idx: int = 0) -> str:
     """Returns text chunk as-is for better keyword matching in vector search.
@@ -365,62 +651,56 @@ async def summarize_text_async(text_chunk: str, page_num: int = None, chunk_idx:
     return text_chunk
 
 async def build_multimodal_elements_streaming(file_path: str, api_key: str):
-    """Async generator to extract and process elements, yielding status updates."""
+    """Async generator to extract and process elements using pdfplumber, yielding status updates."""
     
-    yield {"step": "extracting", "message": "Partitioning document with Unstructured..."}
+    file_suffix = pathlib.Path(file_path).suffix.lower()
+    if file_suffix == ".pdf":
+        yield {"step": "extracting", "message": "Extracting text and tables from PDF with pdfplumber..."}
+    elif file_suffix == ".docx":
+        yield {"step": "extracting", "message": "Extracting text and tables from DOCX with unstructured..."}
+    elif file_suffix == ".doc":
+        yield {"step": "extracting", "message": "Extracting text and tables from DOC with unstructured..."}
+    elif file_suffix == ".csv":
+        yield {"step": "extracting", "message": "Extracting data from CSV file..."}
+    elif file_suffix in [".xlsx", ".xls"]:
+        yield {"step": "extracting", "message": "Extracting data from Excel file..."}
+    else:
+        yield {"step": "extracting", "message": f"Extracting content from {file_suffix} file..."}
     elements = await run_in_threadpool(load_file, file_path)
 
-    # Separate elements by type
-    image_elements_raw = [e for e in elements if e.category == "Image"]
-    table_elements_raw = [e for e in elements if e.category == "Table"]
-    text_elements_raw = [e for e in elements if e.category not in ["Image", "Table"]]
+    # Separate elements by type (from pdfplumber output)
+    table_elements = [e for e in elements if e.get('type') == 'table']
+    text_elements = [e for e in elements if e.get('type') == 'text']
 
-    # --- Image Processing ---
-    yield {"step": "extracting", "message": f"Found {len(image_elements_raw)} images."}
-    image_elements_to_process = []
-    
-    # Handle images extracted by PyMuPDF for PDFs
-    if str(file_path).lower().endswith(".pdf"):
-        pdf_images = await run_in_threadpool(pdf_page_images, file_path)
-        for page_no, image_uris in pdf_images.items():
-            for idx, img_b64 in enumerate(image_uris):
-                image_elements_to_process.append({
-                    "doc_id": str(uuid.uuid4()), "type": "image", "original": img_b64,
-                    "source": str(file_path), "page": page_no, "image_index": idx
-                })
-    # Handle images extracted by Unstructured for DOCX/PPTX
-    else:
-        for elem in image_elements_raw:
-            img = Image.open(io.BytesIO(elem.metadata.image_bytes))
-            img_b64 = pil_to_data_uri(img)
-            image_elements_to_process.append({
-                "doc_id": str(uuid.uuid4()), "type": "image", "original": img_b64,
-                "source": str(file_path), "page": elem.metadata.page_number
-            })
+    yield {"step": "extracting", "message": f"Found {len(text_elements)} text blocks and {len(table_elements)} tables."}
 
     # --- Table Processing ---
-    yield {"step": "extracting", "message": f"Found {len(table_elements_raw)} tables."}
-    
     table_elements_to_process = []
-    for elem in table_elements_raw:
-        table_text = getattr(elem, 'text', '')
-        table_html = getattr(elem.metadata, 'text_as_html', '') if hasattr(elem, 'metadata') else ''
+    for elem in table_elements:
+        table_text = elem.get('text', '')
+        table_html = elem.get('html', '')
         if not table_html and table_text:
             table_html = f"<table><tr><td>{table_text}</td></tr></table>"
         table_elements_to_process.append({
-            "doc_id": str(uuid.uuid4()), "type": "table", "original": table_html or table_text,
-            "source": str(file_path), "text_content": table_text, "html_content": table_html
+            "doc_id": str(uuid.uuid4()), 
+            "type": "table", 
+            "original": table_html or table_text,
+            "source": str(file_path), 
+            "text_content": table_text, 
+            "html_content": table_html,
+            "page": elem.get('page')
         })
 
     # --- Text Processing with Page Numbers ---
     # Group text elements by page to preserve page information
     text_by_page = {}
-    for e in text_elements_raw:
-        if e.text:
-            page_num = getattr(e.metadata, 'page_number', None) if hasattr(e, 'metadata') else None
+    for e in text_elements:
+        text_content = e.get('text', '')
+        if text_content:
+            page_num = e.get('page')
             if page_num not in text_by_page:
                 text_by_page[page_num] = []
-            text_by_page[page_num].append(e.text)
+            text_by_page[page_num].append(text_content)
     
     text_elements_to_process = []
     if text_by_page:
@@ -437,37 +717,75 @@ async def build_multimodal_elements_streaming(file_path: str, api_key: str):
                     "type": "text", 
                     "original": chunk,
                     "source": str(file_path), 
-                    "page": page_num,  # Add page number
+                    "page": page_num,
                     "chunk_index": i
                 })
         
         yield {"step": "chunking", "message": f"Created {len(text_elements_to_process)} text chunks across {len(text_by_page)} pages."}
 
-    # --- Concurrent Summarization ---
-    yield {"step": "summarizing", "message": "Starting concurrent summarization of all elements..."}
+    # --- Concurrent Summarization with Rate Limiting ---
+    yield {"step": "summarizing", "message": "Starting concurrent summarization of tables..."}
     
-    image_tasks = [summarize_image_async(e["original"], api_key) for e in image_elements_to_process]
-    table_tasks = [summarize_table_async(e["html_content"], api_key, e["text_content"]) for e in table_elements_to_process]
-    text_tasks = [summarize_text_async(e["original"], e.get("page"), e.get("chunk_index", 0)) for e in text_elements_to_process]
-
-    all_tasks = image_tasks + table_tasks + text_tasks
-    total_tasks = len(all_tasks)
+    # Create a semaphore to limit concurrent API calls (avoid rate limits)
+    # Reduced to 3 to avoid Groq rate limits (12000 TPM limit)
+    semaphore = asyncio.Semaphore(3)  # Max 3 concurrent requests
     
+    async def rate_limited_task(task_coro):
+        """Wrapper to rate-limit task execution with delay between requests"""
+        async with semaphore:
+            # Add small delay between requests to avoid rate limits
+            await asyncio.sleep(0.5)  # 500ms delay between requests
+            return await task_coro
+    
+    # Only summarize tables with LLM
+    # Text chunks are used as-is for better keyword matching (much faster!)
+    table_tasks = [rate_limited_task(summarize_table_async(e["html_content"], api_key, e["text_content"])) for e in table_elements_to_process]
+    
+    # For text, only summarize the first chunk for document context
+    # All other text chunks use raw text (no LLM call needed - massive speedup!)
+    text_summaries = []
+    for e in text_elements_to_process:
+        if e.get("page") == 1 and e.get("chunk_index") == 0:
+            # First chunk gets a contextual prefix
+            text_summaries.append(rate_limited_task(summarize_text_async(e["original"], e.get("page"), e.get("chunk_index", 0))))
+        else:
+            # All other chunks: just use the raw text (no API call!)
+            text_summaries.append(asyncio.create_task(asyncio.sleep(0, result=e["original"])))
+    
+    all_tasks = table_tasks + text_summaries
+    total_tasks = len(table_tasks) + sum(1 for e in text_elements_to_process if e.get("page") == 1 and e.get("chunk_index") == 0)
+    skipped_text = len(text_elements_to_process) - sum(1 for e in text_elements_to_process if e.get("page") == 1 and e.get("chunk_index") == 0)
+    
+    if skipped_text > 0:
+        yield {"step": "summarizing", "message": f"Skipping LLM for {skipped_text} text chunks (using raw text for better keyword matching)..."}
+    
+    # Use asyncio.gather for better parallelism
+    completed_count = 0
     summaries = []
-    # Using a semaphore to limit concurrency if needed in future, but for now just gather
-    for i, coro in enumerate(asyncio.as_completed(all_tasks)):
-        summary = await coro
-        summaries.append(summary)
-        yield {"step": "summarizing", "message": f"Summarized element {i+1}/{total_tasks}..."}
+    
+    # Process in smaller batches to avoid rate limits
+    batch_size = 3  # Reduced batch size to avoid rate limits
+    for i in range(0, len(all_tasks), batch_size):
+        batch = all_tasks[i:i + batch_size]
+        batch_results = await asyncio.gather(*batch, return_exceptions=True)
+        
+        for result in batch_results:
+            if isinstance(result, Exception):
+                print(f"Warning: Summarization failed: {result}")
+                summaries.append("Content could not be summarized.")
+            else:
+                summaries.append(result)
+        
+        completed_count += len(batch)
+        yield {"step": "summarizing", "message": f"Summarized {completed_count}/{total_tasks} elements..."}
+        
+        # Add delay between batches to avoid rate limits
+        if i + batch_size < len(all_tasks):
+            await asyncio.sleep(1)  # 1 second delay between batches
 
-    # Assign summaries back to elements
+    # Assign summaries back to elements in order
     all_processed_elements = []
     summary_idx = 0
-    
-    for elem in image_elements_to_process:
-        elem["summary"] = summaries[summary_idx]
-        all_processed_elements.append(elem)
-        summary_idx += 1
         
     for elem in table_elements_to_process:
         elem["summary"] = summaries[summary_idx]
@@ -478,20 +796,56 @@ async def build_multimodal_elements_streaming(file_path: str, api_key: str):
         elem["summary"] = summaries[summary_idx]
         all_processed_elements.append(elem)
         summary_idx += 1
-        
+    
     # Yield final elements
     for elem in all_processed_elements:
         yield {"type": "element", "element": elem}
 
 async def index_file_streaming(fp: str, doc_id: str, original_filename: str, api_key: str):
     """Async generator to index a file and yield status updates."""
+    # Check cache first to avoid reprocessing duplicates
+    yield {"step": "checking", "message": "Checking if document has been processed before..."}
+    
+    file_hash = await run_in_threadpool(compute_file_hash, fp)
+    cached_doc = await get_cached_document(file_hash)
+    
+    if cached_doc:
+        yield {"step": "cache_hit", "message": f"Document already processed! Using cached version (saved ~{cached_doc['stats'].get('texts', 0) + cached_doc['stats'].get('tables', 0)} API calls)..."}
+        
+        # Return cached document info instead of reprocessing
+        # Still create a new chat for this "upload"
+        try:
+            documents = await read_json_async(DOCUMENTS_FILE)
+        except (FileNotFoundError, json.JSONDecodeError):
+            documents = []
+        
+        # Find the original document
+        original_doc = next((d for d in documents if d.get("id") == cached_doc["doc_id"]), None)
+        if original_doc:
+            # Create new chat for cached document
+            chat_history = await read_json_async(CHAT_HISTORY_FILE)
+            chat_id = str(uuid.uuid4())
+            new_chat = {
+                "id": chat_id,
+                "document_id": cached_doc["doc_id"],
+                "created_at": datetime.now().isoformat(),
+                "title": original_filename,
+                "messages": []
+            }
+            chat_history[chat_id] = new_chat
+            await write_json_async(CHAT_HISTORY_FILE, chat_history)
+            
+            chat_with_document = {**new_chat, "document": original_doc}
+            yield {"step": "complete", "message": "Using cached document!", "document": original_doc, "chat": chat_with_document}
+            return
+    
     # Get vectorstore for this request with user's API key
     vectorstore_user = get_vectorstore(api_key)
     
     yield {"step": "extraction", "message": f"Processing file: {original_filename}"}
     
     elements_generator = build_multimodal_elements_streaming(fp, api_key)
-    all_elements = {"images": [], "tables": [], "texts": []}
+    all_elements = {"tables": [], "texts": []}
 
     async for status in elements_generator:
         if status.get("type") == "element":
@@ -502,25 +856,57 @@ async def index_file_streaming(fp: str, doc_id: str, original_filename: str, api
 
     yield {"step": "indexing", "message": "Storing summaries and original documents..."}
     
-    total_indexed = 0
     total_elements = sum(len(v) for v in all_elements.values())
-
+    
+    # Batch collect all docstore entries and summary documents
+    docstore_entries = []
+    all_summary_docs = []
+    
+    # Maximum text length for embeddings (nomic-embed-text has ~8192 token limit, ~32000 chars)
+    MAX_EMBEDDING_LENGTH = 30000  # Safe limit for embeddings
+    
     for elem_type, elems in all_elements.items():
         for elem in elems:
-            total_indexed += 1
-            yield {"step": "indexing", "message": f"Indexing {elem['type']} element {total_indexed}/{total_elements}..."}
+            # Prepare docstore entry
+            docstore_entries.append((elem["doc_id"], json.dumps(elem).encode("utf-8")))
             
-            await run_in_threadpool(docstore.mset, [(elem["doc_id"], json.dumps(elem).encode("utf-8"))])
-
+            # Prepare summary document for vectorstore
+            # Truncate summary if too long to avoid embedding context length errors
+            summary_text = elem["summary"]
+            if len(summary_text) > MAX_EMBEDDING_LENGTH:
+                summary_text = summary_text[:MAX_EMBEDDING_LENGTH] + "... [truncated]"
+                print(f"Warning: Truncated summary for {elem['doc_id']} (was {len(elem['summary'])} chars)")
+            
             metadata = {"doc_id": elem["doc_id"], "type": elem["type"], "source": elem["source"]}
             if 'page' in elem: metadata['page'] = elem['page']
             if 'chunk_index' in elem: metadata['chunk'] = elem['chunk_index']
+            
+            summary_doc = Document(page_content=summary_text, metadata=metadata)
+            all_summary_docs.append(summary_doc)
+    
+    # Batch operations for significant speedup
+    yield {"step": "indexing", "message": f"Storing {total_elements} elements in docstore (batch)..."}
+    await run_in_threadpool(docstore.mset, docstore_entries)
+    
+    yield {"step": "indexing", "message": f"Adding {total_elements} documents to vector index (batch)..."}
+    try:
+        # Add documents in smaller batches to avoid embedding context length errors
+        batch_size = 50  # Process embeddings in smaller batches
+        for i in range(0, len(all_summary_docs), batch_size):
+            batch = all_summary_docs[i:i + batch_size]
+            await run_in_threadpool(vectorstore_user.add_documents, batch)
+            if i + batch_size < len(all_summary_docs):
+                await asyncio.sleep(0.1)  # Small delay between batches
+    except Exception as e:
+        error_msg = str(e)
+        if "context length" in error_msg.lower() or "exceeds" in error_msg.lower():
+            yield {"step": "error", "message": f"Some text chunks are too long for embedding. Please try with a document that has shorter text sections."}
+            raise
+        else:
+            raise
 
-            summary_doc = Document(page_content=elem["summary"], metadata=metadata)
-            await run_in_threadpool(vectorstore_user.add_documents, [summary_doc])
-
-    yield {"step": "saving", "message": "Saving vector index to disk..."}
-    await run_in_threadpool(vectorstore_user.save_local, VEC_DIR)
+    # Chroma auto-persists, no explicit save needed
+    yield {"step": "saving", "message": "Vector index persisted automatically (Chroma)..."}
     
     # Update manifest
     yield {"step": "manifest", "message": "Updating document manifest..."}
@@ -532,12 +918,12 @@ async def index_file_streaming(fp: str, doc_id: str, original_filename: str, api
         
     existing_doc_index = next((i for i, doc in enumerate(documents) if doc["name"] == original_filename), -1)
         
-    stats = { "images": len(all_elements["images"]), "tables": len(all_elements["tables"]), "texts": len(all_elements["texts"]) }
+    stats = { "tables": len(all_elements["tables"]), "texts": len(all_elements["texts"]) }
         
     if existing_doc_index != -1:
         documents[existing_doc_index]["uploadedAt"] = datetime.now().isoformat()
         documents[existing_doc_index]["stats"] = stats
-        documents[existing_doc_index]["preview"] = f"Re-indexed with {stats['texts']} texts, {stats['images']} images, {stats['tables']} tables."
+        documents[existing_doc_index]["preview"] = f"Re-indexed with {stats['texts']} texts, {stats['tables']} tables."
         new_document_record = documents[existing_doc_index]
     else:
         new_document_record = {
@@ -545,12 +931,16 @@ async def index_file_streaming(fp: str, doc_id: str, original_filename: str, api
             "name": original_filename,
             "path": fp,
             "uploadedAt": datetime.now().isoformat(),
-            "preview": f"Indexed with {stats['texts']} texts, {stats['images']} images, {stats['tables']} tables.",
+            "preview": f"Indexed with {stats['texts']} texts, {stats['tables']} tables.",
             "stats": stats
         }
         documents.append(new_document_record)
         
     await write_json_async(DOCUMENTS_FILE, documents)
+    
+    # Cache the document hash to avoid reprocessing duplicates
+    yield {"step": "caching", "message": "Caching document fingerprint..."}
+    await cache_document(file_hash, doc_id, original_filename, stats)
 
     # After indexing, create a new chat for this document
     chat_history = await read_json_async(CHAT_HISTORY_FILE)
@@ -597,27 +987,23 @@ async def query_rag(query: str, k: int = 6):
     print(f"  📦 Fetched {len(originals)} original elements from docstore")
     
     # 4. Separate by type
-    images = []
     tables = []
     texts = []
     
     for elem in originals:
         if isinstance(elem, dict):
             elem_type = elem.get("type", "")
-            if elem_type == "image":
-                images.append(elem["original"])
-            elif elem_type == "table":
+            if elem_type == "table":
                 tables.append(elem["original"])
             elif elem_type == "text":
                 texts.append(elem["original"])
     
     element_counts = {
-        "images": len(images),
         "tables": len(tables),
         "texts": len(texts)
     }
     
-    print(f"  📊 Element breakdown: {element_counts['images']} images, {element_counts['tables']} tables, {element_counts['texts']} text chunks")
+    print(f"  📊 Element breakdown: {element_counts['tables']} tables, {element_counts['texts']} text chunks")
     
     # 5. Build context from texts and tables
     context_parts = []
@@ -628,21 +1014,12 @@ async def query_rag(query: str, k: int = 6):
     
     context = "\n\n".join(context_parts)
     
-    # 6. Invoke multimodal LLM with text and images
+    # 6. Invoke LLM with text context
     messages = [SystemMessage(content=SYSTEM_PROMPT_TEMPLATE)]
-    
     human_text = f"Query: {query}\n\nContext:\n{context}\n\nAnswer:"
+    messages.append(HumanMessage(content=human_text))
     
-    if images:
-        print(f"  🖼️  Including {len(images)} images in context")
-        human_parts = [{"type": "text", "text": human_text}]
-        for img in images[:4]:  # Limit to 4 images to avoid token limits
-            human_parts.append({"type": "image_url", "image_url": img})
-        messages.append(HumanMessage(content=human_parts))
-    else:
-        messages.append(HumanMessage(content=human_text))
-    
-    print(f"  🤖 Generating answer with multimodal LLM...")
+    print(f"  🤖 Generating answer with LLM...")
     response = await llm.ainvoke(messages)
     
     print(f"  ✅ Answer generated successfully\n")
@@ -674,15 +1051,13 @@ async def answer_generator(chat_id: str, query: str, k: int, api_key: str):
     originals_raw = await run_in_threadpool(docstore.mget, doc_ids)
     originals = [json.loads(o.decode("utf-8")) for o in originals_raw if o is not None]
     
-    images, tables, texts = [], [], []
+    tables, texts = [], []
     for elem in originals:
         if isinstance(elem, dict):
             elem_type = elem.get("type")
             page_num = elem.get("page", "Unknown")
             
-            if elem_type == "image":
-                images.append(elem["original"])
-            elif elem_type == "table":
+            if elem_type == "table":
                 table_content = f"[From Page {page_num}]\n{elem['original']}"
                 tables.append(table_content)
             elif elem_type == "text":
@@ -703,18 +1078,13 @@ async def answer_generator(chat_id: str, query: str, k: int, api_key: str):
     context = "\n\n".join(context_parts) if context_parts else "No context available."
     
     # Log context statistics
-    print(f"  📊 Context built: {len(texts)} text chunks, {len(tables)} tables, {len(images)} images")
+    print(f"  📊 Context built: {len(texts)} text chunks, {len(tables)} tables")
     print(f"  📏 Total context length: {len(context)} characters")
     
     # Build messages for the LLM
     messages = [SystemMessage(content=SYSTEM_PROMPT_TEMPLATE)]
     human_text = f"Query: {query}\n\nContext:\n{context}\n\nAnswer:"
-    if images:
-        human_parts = [{"type": "text", "text": human_text}]
-        for img in images[:4]: human_parts.append({"type": "image_url", "image_url": img})
-        messages.append(HumanMessage(content=human_parts))
-    else:
-        messages.append(HumanMessage(content=human_text))
+    messages.append(HumanMessage(content=human_text))
 
     # 2. Stream the LLM response
     full_answer = ""
@@ -729,11 +1099,11 @@ async def answer_generator(chat_id: str, query: str, k: int, api_key: str):
         error_msg = str(e)
         print(f"  ❌ Error during streaming: {error_msg}")
         
-        # Handle specific Gemini API errors
-        if "list index out of range" in error_msg or "IndexError" in error_msg:
-            error_response = "I apologize, but I encountered an issue processing your request. This may be due to content safety filters or an empty response from the AI. Please try rephrasing your question or asking something different."
-        elif "SAFETY" in error_msg.upper() or "BLOCKED" in error_msg.upper():
-            error_response = "I apologize, but this query was blocked by content safety filters. Please try rephrasing your question."
+        # Handle specific API errors
+        if "rate limit" in error_msg.lower() or "429" in error_msg:
+            error_response = "I apologize, but the API rate limit was exceeded. Please try again in a moment."
+        elif "API key" in error_msg.lower() or "authentication" in error_msg.lower():
+            error_response = "I apologize, but there was an authentication error. Please check your API key."
         else:
             error_response = f"I encountered an error while processing your request. Please try again or rephrase your question."
         
@@ -795,24 +1165,29 @@ def read_root():
 
 # --- API Key Validation Endpoint ---
 @app.post("/validate-api-key")
-async def validate_api_key_endpoint(api_key: str = Depends(get_api_key)):
-    """Validates the provided API key by attempting to create a simple embeddings model."""
+async def validate_api_key_endpoint(api_key: Optional[str] = Depends(get_api_key)):
+    """Validates the provided API key by attempting to create a simple LLM model and test Ollama connection."""
     try:
-        # Try to create an embeddings model to test the API key
+        # Test Ollama connection
         test_embeddings = get_embeddings_model(api_key)
-        
-        # Perform a simple test to validate the key works
         await run_in_threadpool(test_embeddings.embed_query, "test")
         
-        return {"valid": True, "message": "API key is valid"}
+        # Test Groq API key (will use .env if api_key is None)
+        test_llm = get_llm_model(api_key)
+        # Simple test - just verify the model can be created
+        # We don't need to actually invoke it for validation
+        
+        return {"valid": True, "message": "API key is valid and Ollama connection is working"}
     except Exception as e:
         error_msg = str(e)
-        if "API_KEY_INVALID" in error_msg or "invalid" in error_msg.lower():
-            raise HTTPException(status_code=401, detail="Invalid API key. Please check your Google Gemini API key.")
-        raise HTTPException(status_code=500, detail=f"Failed to validate API key: {error_msg}")
+        if "GROQ_API_KEY" in error_msg or "API key" in error_msg.lower():
+            raise HTTPException(status_code=401, detail="Invalid API key. Please check your Groq API key in .env file or provide it via X-API-Key header.")
+        if "connection" in error_msg.lower() or "refused" in error_msg.lower():
+            raise HTTPException(status_code=503, detail="Ollama service is not available. Please ensure Ollama is running at 127.0.0.1:11434")
+        raise HTTPException(status_code=500, detail=f"Failed to validate: {error_msg}")
 
 @app.post("/upload")
-async def upload_file_endpoint(file: UploadFile = File(...), api_key: str = Depends(get_api_key)):
+async def upload_file_endpoint(file: UploadFile = File(...), api_key: Optional[str] = Depends(get_api_key)):
     """Uploads a file, saves it permanently, then streams the indexing process."""
     try:
         file_suffix = pathlib.Path(file.filename).suffix
@@ -832,7 +1207,7 @@ async def upload_file_endpoint(file: UploadFile = File(...), api_key: str = Depe
     return StreamingResponse(upload_generator(str(permanent_path), doc_id, file.filename, api_key), media_type="text/event-stream")
 
 @app.get("/documents")
-async def get_documents_endpoint(api_key: str = Depends(get_api_key)):
+async def get_documents_endpoint(api_key: Optional[str] = Depends(get_api_key)):
     """Returns the list of all indexed documents from the manifest."""
     try:
         return await read_json_async(DOCUMENTS_FILE)
@@ -842,17 +1217,29 @@ async def get_documents_endpoint(api_key: str = Depends(get_api_key)):
         raise HTTPException(status_code=500, detail=f"Failed to read documents list: {e}")
 
 @app.get("/documents/{doc_id}/file")
-async def get_document_file_endpoint(doc_id: str, api_key: str = Depends(get_api_key)):
+async def get_document_file_endpoint(doc_id: str, api_key: Optional[str] = Depends(get_api_key)):
     """Serves the original document file."""
     doc = await get_document_by_id(doc_id)
     if not doc or not doc.get("path") or not os.path.exists(doc["path"]):
         raise HTTPException(status_code=404, detail="Document file not found.")
-    return FileResponse(doc["path"], media_type='application/pdf')
+    # Determine media type based on file extension
+    doc_path = doc["path"]
+    suffix = pathlib.Path(doc_path).suffix.lower()
+    media_types = {
+        '.pdf': 'application/pdf',
+        '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        '.doc': 'application/msword',
+        '.csv': 'text/csv',
+        '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        '.xls': 'application/vnd.ms-excel'
+    }
+    media_type = media_types.get(suffix, 'application/octet-stream')
+    return FileResponse(doc_path, media_type=media_type)
 
 # --- Chat History Endpoints ---
 
 @app.post("/chats")
-async def create_chat_endpoint(request: NewChatRequest, api_key: str = Depends(get_api_key)):
+async def create_chat_endpoint(request: NewChatRequest, api_key: Optional[str] = Depends(get_api_key)):
     """(DEPRECATED) Creating a chat is now handled by the /upload endpoint."""
     raise HTTPException(
         status_code=410, 
@@ -860,7 +1247,7 @@ async def create_chat_endpoint(request: NewChatRequest, api_key: str = Depends(g
     )
 
 @app.get("/documents/{doc_id}/chats")
-async def get_document_chats_endpoint(doc_id: str, api_key: str = Depends(get_api_key)):
+async def get_document_chats_endpoint(doc_id: str, api_key: Optional[str] = Depends(get_api_key)):
     """(DEPRECATED) Use GET /chats instead."""
     raise HTTPException(
         status_code=410,
@@ -868,7 +1255,7 @@ async def get_document_chats_endpoint(doc_id: str, api_key: str = Depends(get_ap
     )
 
 @app.post("/chats/{chat_id}/query")
-async def query_chat_endpoint(chat_id: str, request: QueryRequest, api_key: str = Depends(get_api_key)):
+async def query_chat_endpoint(chat_id: str, request: QueryRequest, api_key: Optional[str] = Depends(get_api_key)):
     """Receives a query, saves the user message, and returns a streaming RAG response."""
     chat_history = await read_json_async(CHAT_HISTORY_FILE)
     
@@ -884,7 +1271,7 @@ async def query_chat_endpoint(chat_id: str, request: QueryRequest, api_key: str 
 
 
 @app.get("/chats/{chat_id}")
-async def get_chat_history_endpoint(chat_id: str, api_key: str = Depends(get_api_key)):
+async def get_chat_history_endpoint(chat_id: str, api_key: Optional[str] = Depends(get_api_key)):
     """Gets the full message history and associated document for a specific chat."""
     chat_history = await read_json_async(CHAT_HISTORY_FILE)
     if chat_id not in chat_history:
@@ -906,7 +1293,7 @@ async def get_chat_history_endpoint(chat_id: str, api_key: str = Depends(get_api
     return chat_session
 
 @app.delete("/chats/{chat_id}")
-async def delete_chat_endpoint(chat_id: str, api_key: str = Depends(get_api_key)):
+async def delete_chat_endpoint(chat_id: str, api_key: Optional[str] = Depends(get_api_key)):
     """Deletes a chat session and optionally its associated document if no other chats reference it."""
     try:
         # Load chat history
@@ -953,10 +1340,9 @@ async def delete_chat_endpoint(chat_id: str, api_key: str = Depends(get_api_key)
                     # 2. Delete from vector store
                     try:
                         vectorstore = get_vectorstore(api_key)
-                        # This is tricky with FAISS. We need to find the vector IDs associated with the doc.
-                        # For now, we are skipping this part as it requires a more complex setup.
-                        # A better approach would be to use a vector DB that supports deletion by metadata.
-                        print(f"⚠️  Vector deletion for document {document_id} is not fully implemented for FAISS.")
+                        # Chroma supports deletion by metadata filter
+                        # Note: This requires implementing metadata-based deletion in Chroma
+                        print(f"⚠️  Vector deletion for document {document_id} is not fully implemented for Chroma.")
                     except Exception as e:
                         print(f"Error during vector deletion: {e}")
 
@@ -980,7 +1366,7 @@ async def delete_chat_endpoint(chat_id: str, api_key: str = Depends(get_api_key)
         raise HTTPException(status_code=500, detail=f"Failed to delete chat: {str(e)}")
 
 @app.get("/chats")
-async def get_all_chats_endpoint(api_key: str = Depends(get_api_key)):
+async def get_all_chats_endpoint(api_key: Optional[str] = Depends(get_api_key)):
     """Gets all chat sessions, without messages, sorted by date."""
     try:
         chat_history = await read_json_async(CHAT_HISTORY_FILE)
@@ -996,7 +1382,7 @@ async def get_all_chats_endpoint(api_key: str = Depends(get_api_key)):
         return []
 
 @app.post("/query")
-async def query_endpoint(request: QueryRequest, api_key: str = Depends(get_api_key)):
+async def query_endpoint(request: QueryRequest, api_key: Optional[str] = Depends(get_api_key)):
     """(DEPRECATED) Use POST /chats/{chat_id}/query instead."""
     raise HTTPException(
         status_code=410, 

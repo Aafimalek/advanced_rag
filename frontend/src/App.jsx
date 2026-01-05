@@ -4,8 +4,6 @@ import Toast from './components/ui/Toast';
 import DocumentViewer from './components/DocumentViewer';
 import ChatPanel from './components/ChatPanel';
 import ChatSidebar from './components/ChatSidebar.jsx';
-import ApiKeyModal from './components/ApiKeyModal';
-import ApiKeySettings from './components/ApiKeySettings';
 
 class ErrorBoundary extends Component {
   constructor(props) {
@@ -50,9 +48,6 @@ class ErrorBoundary extends Component {
 const API_URL = 'http://127.0.0.1:8000';
 
 function App() {
-  // API Key State
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem('gemini_api_key') || null);
-  
   // Global State
   const [toast, setToast] = useState(null);
   const [error, setError] = useState('');
@@ -77,15 +72,9 @@ function App() {
 
   // Fetch all chats on initial load
   useEffect(() => {
-    if (!apiKey) return; // Don't fetch if no API key
-    
     const fetchChats = async () => {
       try {
-        const response = await fetch(`${API_URL}/chats`, {
-          headers: {
-            'X-API-Key': apiKey
-          }
-        });
+        const response = await fetch(`${API_URL}/chats`);
         if (!response.ok) throw new Error('Failed to fetch chats');
         const chatData = await response.json();
         
@@ -107,11 +96,11 @@ function App() {
       }
     };
     fetchChats();
-  }, [apiKey]); // Reload chats when API key changes
+  }, []); // Fetch chats on mount
 
   // Fetch full chat details (messages and document) when activeChatId changes
   useEffect(() => {
-    if (!apiKey || !activeChatId || activeChatId.startsWith('uploading-')) {
+    if (!activeChatId || activeChatId.startsWith('uploading-')) {
       if (!activeChatId) {
         setActiveChat(null);
         setMessages([]);
@@ -121,11 +110,7 @@ function App() {
     const fetchChatDetails = async () => {
       setIsAnswering(true);
       try {
-        const response = await fetch(`${API_URL}/chats/${activeChatId}`, {
-          headers: {
-            'X-API-Key': apiKey
-          }
-        });
+        const response = await fetch(`${API_URL}/chats/${activeChatId}`);
         if (!response.ok) throw new Error('Failed to fetch chat details');
         const chatData = await response.json();
         console.log('Fetched chat data:', chatData);
@@ -143,7 +128,7 @@ function App() {
       }
     };
     fetchChatDetails();
-  }, [activeChatId, apiKey]);
+  }, [activeChatId]);
 
 
   // --- Event Handlers ---
@@ -166,8 +151,7 @@ function App() {
       const response = await fetch(`${API_URL}/chats/${activeChatId}/query`, {
         method: 'POST',
         headers: { 
-          'Content-Type': 'application/json',
-          'X-API-Key': apiKey
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify({ query: userMessage.text, k: 20 }),
       });
@@ -229,10 +213,7 @@ function App() {
   const handleDeleteChat = async (chatId) => {
     try {
       const response = await fetch(`${API_URL}/chats/${chatId}`, {
-        method: 'DELETE',
-        headers: {
-          'X-API-Key': apiKey
-        }
+        method: 'DELETE'
       });
 
       if (!response.ok) {
@@ -295,9 +276,6 @@ function App() {
     try {
       const response = await fetch(`${API_URL}/upload`, {
         method: 'POST',
-        headers: {
-          'X-API-Key': apiKey
-        },
         body: formData,
       });
 
@@ -361,9 +339,6 @@ function App() {
   
   return (
     <ErrorBoundary>
-      {/* API Key Modal */}
-      {!apiKey && <ApiKeyModal onApiKeySet={setApiKey} />}
-      
       <div className="h-screen flex flex-col bg-gradient-to-br from-[#1a1625] via-[#241e30] to-[#1a1625] text-[#fef3f0]">
         {/* Header - Modern Glassmorphism */}
         <header className="h-[72px] glass-effect border-b border-white/5 flex items-center px-6 gap-4 relative z-[100] shadow-[0_4px_24px_rgba(0,0,0,0.4)]">
@@ -389,8 +364,6 @@ function App() {
           </div>
           
           <div className="flex items-center gap-3">
-            <ApiKeySettings apiKey={apiKey} onApiKeyChange={setApiKey} />
-            
             <label 
               htmlFor="upload-input"
               className={`group relative px-5 py-2.5 rounded-xl text-sm font-semibold transition-all duration-300 inline-flex items-center gap-2 overflow-hidden
@@ -434,7 +407,7 @@ function App() {
 
           {/* Main Content Area */}
           <main className="flex-1 flex overflow-hidden gap-0.5 bg-white/5">
-            <DocumentViewer document={activeChat?.document} apiKey={apiKey} />
+            <DocumentViewer document={activeChat?.document} />
             <ChatPanel
               activeChat={activeChat}
               messages={messages}
